@@ -115,6 +115,7 @@ fn inheritance_preserves_head_index_worktree_and_ignored_state() {
         &[
             "add",
             "--inherit",
+            "--allow-copy",
             "--json",
             "-b",
             "inherited",
@@ -195,6 +196,7 @@ fn inheritance_target_mismatch_refuses_before_branch_or_destination_creation() {
         &[
             "add",
             "--inherit",
+            "--allow-copy",
             "--json",
             "-b",
             "wrong-target",
@@ -244,6 +246,7 @@ fn inheritance_preserves_unmerged_index_stages_and_conflict_bytes() {
         &[
             "add",
             "--inherit",
+            "--allow-copy",
             "--json",
             "--detach",
             destination.to_str().unwrap(),
@@ -287,6 +290,7 @@ fn tracked_symlink_refuses_inherited_symlink_ancestor_without_outside_write() {
         &[
             "add",
             "--inherit",
+            "--allow-copy",
             "--json",
             "-b",
             "contained",
@@ -328,6 +332,7 @@ fn tracked_symlink_lands_before_read_only_directory_metadata_is_finalized() {
         &[
             "add",
             "--inherit",
+            "--allow-copy",
             "--json",
             "-b",
             "read-only-dir",
@@ -367,6 +372,7 @@ fn donor_head_move_with_identical_tree_aborts_and_rolls_back() {
         .args([
             "add",
             "--inherit",
+            "--allow-copy",
             "--json",
             "-b",
             "head-race",
