@@ -38,7 +38,9 @@ struct FakeIo {
     fail_aux_signature_permissions: bool,
     fail_restore: bool,
     fail_read_sidecar: bool,
+    unreadable_path: Option<PathBuf>,
     mutate_on_lock: bool,
+    mutate_cargo_on_lock: bool,
     mutate_unrelated_record: bool,
     lock_held: bool,
 }
@@ -67,6 +69,9 @@ impl UpdateIo for FakeIo {
     }
 
     fn read_file(&self, path: &Path) -> io::Result<Vec<u8>> {
+        if self.unreadable_path.as_deref() == Some(path) {
+            return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+        }
         if self.fail_read_sidecar && path.to_string_lossy().contains(".ramiz-checksums") {
             return Err(io::Error::from(io::ErrorKind::PermissionDenied));
         }
@@ -95,13 +100,34 @@ impl UpdateIo for FakeIo {
         {
             return Ok(failure_output());
         }
+        if args.first().map(String::as_str) == Some("install")
+            || command.ends_with("cargo-binstall")
+        {
+            let version = args
+                .windows(2)
+                .find_map(|pair| (pair[0] == "--version").then_some(pair[1].as_str()))
+                .unwrap_or("1.1.0");
+            let root = args
+                .windows(2)
+                .find_map(|pair| (pair[0] == "--root").then_some(PathBuf::from(&pair[1])))
+                .unwrap_or_else(|| PathBuf::from("/cargo"));
+            if command.ends_with("cargo-binstall") {
+                binstall_records_in(&mut self.files, &root, version);
+            } else {
+                legacy_cargo_records_in(&mut self.files, &root, version);
+            }
+        }
         if self.mutate_unrelated_record
             && (args.first().map(String::as_str) == Some("install")
                 || command.ends_with("cargo-binstall"))
         {
             self.files.insert(
                 PathBuf::from("/cargo/.crates2.json"),
-                br#"{"ramiz 1.0.0":{"bins":["ramiz","git-ramiz"]},"other 1.0.0":{"bins":["other"]}}"#.to_vec(),
+                br#"{"installs":{"ramiz 1.1.0 (registry+https://github.com/rust-lang/crates.io-index)":{"bins":["ramiz","git-ramiz"]},"other 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)":{"bins":["other"]}}}"#.to_vec(),
+            );
+            self.files.insert(
+                PathBuf::from("/cargo/binstall/crates-v1.json"),
+                br#"{"name":"ramiz","version_req":"=1.1.0","current_version":"1.1.0","source":{"source_type":"Registry","url":"https://github.com/rust-lang/crates.io-index"},"target":"test-host","bins":["ramiz","git-ramiz"]}{"name":"other","version_req":"=1.0.0","current_version":"1.0.0","source":{"source_type":"Registry","url":"https://github.com/rust-lang/crates.io-index"},"target":"test-host","bins":["other"]}"#.to_vec(),
             );
         }
         if args.first().map(String::as_str) == Some("--version") {
@@ -177,6 +203,9 @@ impl UpdateIo for FakeIo {
                         "new signature",
                     );
                 }
+            }
+            if self.mutate_cargo_on_lock {
+                legacy_cargo_records_in(&mut self.files, Path::new("/cargo"), "2.0.0");
             }
             Ok(())
         }
@@ -265,6 +294,48 @@ fn marker_for(primary: &[u8], secondary: &[u8]) -> String {
     )
 }
 
+fn cargo_v1_manifest(version: &str) -> String {
+    format!(
+        "[v1]\n\"other 1.0.0 (git+https://example.invalid/other)\" = [\n    \"other\",\n]\n\"ramiz {version} (registry+https://github.com/rust-lang/crates.io-index)\" = [\n    \"git-ramiz\",\n    \"ramiz\",\n]\n"
+    )
+}
+
+fn legacy_cargo_manifest(version: &str) -> String {
+    format!(
+        r#"{{"installs":{{"ramiz {version} (registry+https://github.com/rust-lang/crates.io-index)":{{"bins":["ramiz","git-ramiz"]}}}}}}"#
+    )
+}
+
+fn binstall_manifest(version: &str, target: &str) -> String {
+    format!(
+        r#"{{"name":"ramiz","version_req":"={version}","current_version":"{version}","source":{{"source_type":"Registry","url":"https://github.com/rust-lang/crates.io-index"}},"target":"{target}","bins":["ramiz","git-ramiz"]}}{{"name":"other","version_req":"=1.0.0","current_version":"1.0.0","source":{{"source_type":"Registry","url":"https://github.com/rust-lang/crates.io-index"}},"target":"test-host","bins":["other"]}}"#
+    )
+}
+
+fn legacy_cargo_records_in(files: &mut HashMap<PathBuf, Vec<u8>>, root: &Path, version: &str) {
+    files.insert(root.join(".crates.toml"), cargo_v1_manifest(version).into());
+    files.insert(
+        root.join(".crates2.json"),
+        legacy_cargo_manifest(version).into(),
+    );
+}
+
+fn binstall_records_in(files: &mut HashMap<PathBuf, Vec<u8>>, root: &Path, version: &str) {
+    files.insert(root.join(".crates.toml"), cargo_v1_manifest(version).into());
+    files.insert(
+        root.join("binstall/crates-v1.json"),
+        binstall_manifest(version, "test-host").into(),
+    );
+}
+
+fn legacy_cargo_records(io: &mut FakeIo, root: &Path, version: &str) {
+    legacy_cargo_records_in(&mut io.files, root, version);
+}
+
+fn binstall_records(io: &mut FakeIo, root: &Path, version: &str) {
+    binstall_records_in(&mut io.files, root, version);
+}
+
 #[test]
 fn homebrew_refusal_contains_exact_upgrade_command() {
     let mut io = FakeIo::default();
@@ -331,10 +402,7 @@ fn cargo_prefers_binstall_and_pins_exact_version() {
     io.available_commands.insert("cargo-binstall".into());
     io.file(&executable, "old");
     io.file(&companion, "old");
-    io.file(
-        cargo_home.join(".crates2.json"),
-        r#"{"ramiz 1.0.0":{"bins":["ramiz","git-ramiz"]}}"#,
-    );
+    binstall_records(&mut io, &cargo_home, "1.0.0");
     io.installed_version = "1.1.0".into();
     let mut service = service(io);
     let result = service
@@ -351,11 +419,310 @@ fn cargo_prefers_binstall_and_pins_exact_version() {
 }
 
 #[test]
+fn cargo_binstall_v123_shape_is_accepted_without_crates2() {
+    let cargo_home = PathBuf::from("/cargo");
+    let executable = cargo_home.join("bin/ramiz");
+    let companion = cargo_home.join("bin/git-ramiz");
+    let mut io = FakeIo {
+        cargo_home: Some(cargo_home.clone()),
+        installed_version: "1.1.0".into(),
+        ..FakeIo::default()
+    };
+    io.available_commands.insert("cargo-binstall".into());
+    io.file(&executable, "old");
+    io.file(&companion, "old");
+    binstall_records(&mut io, &cargo_home, "1.0.0");
+    let mut service = service(io);
+    assert_eq!(
+        service
+            .run(&UpdateRequest::new(false, &executable, "1.0.0"))
+            .unwrap()
+            .installer,
+        Installer::Cargo
+    );
+}
+
+#[test]
+fn unpinned_binstall_requirement_proves_the_installed_version() {
+    for requirement in ["*", "^1"] {
+        let cargo_home = PathBuf::from("/cargo");
+        let executable = cargo_home.join("bin/ramiz");
+        let companion = cargo_home.join("bin/git-ramiz");
+        let mut io = FakeIo {
+            cargo_home: Some(cargo_home.clone()),
+            ..FakeIo::default()
+        };
+        io.file(&executable, "old");
+        io.file(&companion, "old");
+        binstall_records(&mut io, &cargo_home, "1.0.0");
+        let selected = binstall_manifest("1.0.0", "test-host").replacen(
+            r#""version_req":"=1.0.0""#,
+            &format!(r#""version_req":"{requirement}""#),
+            1,
+        );
+        io.file(cargo_home.join("binstall/crates-v1.json"), selected);
+        let mut service = service(io);
+        let result = service
+            .run(&UpdateRequest::new(true, &executable, "1.0.0"))
+            .unwrap();
+        assert_eq!(result.installer, Installer::Cargo);
+    }
+}
+
+#[test]
+fn cargo_binstall_conflicting_ramiz_provenance_is_unknown() {
+    let cargo_home = PathBuf::from("/cargo");
+    let executable = cargo_home.join("bin/ramiz");
+    let companion = cargo_home.join("bin/git-ramiz");
+    let mut io = FakeIo {
+        cargo_home: Some(cargo_home.clone()),
+        ..FakeIo::default()
+    };
+    io.file(&executable, "old");
+    io.file(&companion, "old companion");
+    binstall_records(&mut io, &cargo_home, "1.0.0");
+    io.file(
+        cargo_home.join("binstall/crates-v1.json"),
+        r#"{"name":"ramiz","version_req":"=1.0.0","current_version":"1.0.0","source":{"source_type":"Git","url":"https://example.invalid/ramiz"},"target":"test-host","bins":["ramiz","git-ramiz"]}"#,
+    );
+    let mut service = service(io);
+    let error = service
+        .run(&UpdateRequest::new(false, &executable, "1.0.0"))
+        .unwrap_err();
+    assert_eq!(error.code, "unknown_installer");
+    assert_eq!(error.installer, Some(Installer::Unknown));
+}
+
+#[test]
+fn conflicting_manager_versions_never_authorize_an_installer() {
+    let cargo_home = PathBuf::from("/cargo");
+    let executable = cargo_home.join("bin/ramiz");
+    let companion = cargo_home.join("bin/git-ramiz");
+    let mut io = FakeIo {
+        cargo_home: Some(cargo_home.clone()),
+        ..FakeIo::default()
+    };
+    io.file(&executable, "old");
+    io.file(&companion, "old companion");
+    legacy_cargo_records(&mut io, &cargo_home, "1.0.0");
+    io.file(cargo_home.join(".crates.toml"), cargo_v1_manifest("2.0.0"));
+    io.file(
+        cargo_home.join("binstall/crates-v1.json"),
+        binstall_manifest("2.0.0", "test-host"),
+    );
+    let mut service = service(io);
+    let error = service
+        .run(&UpdateRequest::new(false, &executable, "1.0.0"))
+        .unwrap_err();
+    assert_eq!(error.code, "cargo_record_unproven");
+    assert!(service.io.commands.is_empty());
+}
+
+#[test]
+fn cargo_version_change_while_acquiring_lock_refuses_before_installer() {
+    let cargo_home = PathBuf::from("/cargo");
+    let executable = cargo_home.join("bin/ramiz");
+    let companion = cargo_home.join("bin/git-ramiz");
+    let mut io = FakeIo {
+        cargo_home: Some(cargo_home.clone()),
+        mutate_cargo_on_lock: true,
+        ..FakeIo::default()
+    };
+    io.file(&executable, "old");
+    io.file(&companion, "old companion");
+    legacy_cargo_records(&mut io, &cargo_home, "1.0.0");
+    let mut service = service(io);
+    let error = service
+        .run(&UpdateRequest::new(false, &executable, "1.0.0"))
+        .unwrap_err();
+    assert_eq!(error.code, "installation_changed");
+    assert!(service.io.commands.is_empty());
+}
+
+#[test]
+fn malformed_present_legacy_record_fails_closed() {
+    let cargo_home = PathBuf::from("/cargo");
+    let executable = cargo_home.join("bin/ramiz");
+    let companion = cargo_home.join("bin/git-ramiz");
+    let mut io = FakeIo {
+        cargo_home: Some(cargo_home.clone()),
+        ..FakeIo::default()
+    };
+    io.file(&executable, "old");
+    io.file(&companion, "old companion");
+    binstall_records(&mut io, &cargo_home, "1.0.0");
+    io.file(cargo_home.join(".crates2.json"), "{broken");
+    let mut service = service(io);
+    let error = service
+        .run(&UpdateRequest::new(false, &executable, "1.0.0"))
+        .unwrap_err();
+    assert_eq!(error.code, "unknown_installer");
+    assert!(service.io.commands.is_empty());
+}
+
+#[test]
+fn unreadable_present_manager_record_fails_closed() {
+    let cargo_home = PathBuf::from("/cargo");
+    let executable = cargo_home.join("bin/ramiz");
+    let companion = cargo_home.join("bin/git-ramiz");
+    let legacy = cargo_home.join(".crates2.json");
+    let mut io = FakeIo {
+        cargo_home: Some(cargo_home.clone()),
+        unreadable_path: Some(legacy.clone()),
+        ..FakeIo::default()
+    };
+    io.file(&executable, "old");
+    io.file(&companion, "old companion");
+    binstall_records(&mut io, &cargo_home, "1.0.0");
+    io.file(&legacy, legacy_cargo_manifest("1.0.0"));
+    let mut service = service(io);
+    let error = service
+        .run(&UpdateRequest::new(false, &executable, "1.0.0"))
+        .unwrap_err();
+    assert_eq!(error.code, "unknown_installer");
+    assert!(service.io.commands.is_empty());
+}
+
+#[test]
+fn source_less_and_duplicate_legacy_identities_fail_closed() {
+    for record in [
+        r#"{"installs":{"ramiz 1.0.0":{"bins":["ramiz","git-ramiz"]}}}"#,
+        r#"{"installs":{"ramiz 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)":{"bins":["ramiz","git-ramiz"]},"ramiz 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)":{"bins":["ramiz","git-ramiz"]}}}"#,
+    ] {
+        let cargo_home = PathBuf::from("/cargo");
+        let executable = cargo_home.join("bin/ramiz");
+        let companion = cargo_home.join("bin/git-ramiz");
+        let mut io = FakeIo {
+            cargo_home: Some(cargo_home.clone()),
+            ..FakeIo::default()
+        };
+        io.file(&executable, "old");
+        io.file(&companion, "old companion");
+        io.file(cargo_home.join(".crates.toml"), cargo_v1_manifest("1.0.0"));
+        io.file(cargo_home.join(".crates2.json"), record);
+        let mut service = service(io);
+        assert_eq!(
+            service
+                .run(&UpdateRequest::new(false, &executable, "1.0.0"))
+                .unwrap_err()
+                .code,
+            "unknown_installer"
+        );
+        assert!(service.io.commands.is_empty());
+    }
+}
+
+#[test]
+fn binstall_target_must_match_the_host() {
+    let cargo_home = PathBuf::from("/cargo");
+    let executable = cargo_home.join("bin/ramiz");
+    let companion = cargo_home.join("bin/git-ramiz");
+    let mut io = FakeIo {
+        cargo_home: Some(cargo_home.clone()),
+        ..FakeIo::default()
+    };
+    io.file(&executable, "old");
+    io.file(&companion, "old companion");
+    io.file(cargo_home.join(".crates.toml"), cargo_v1_manifest("1.0.0"));
+    io.file(
+        cargo_home.join("binstall/crates-v1.json"),
+        binstall_manifest("1.0.0", "wrong-platform"),
+    );
+    let mut service = service(io);
+    assert_eq!(
+        service
+            .run(&UpdateRequest::new(false, &executable, "1.0.0"))
+            .unwrap_err()
+            .code,
+        "unknown_installer"
+    );
+}
+
+#[test]
+fn binstall_requirement_must_include_the_recorded_version() {
+    for requirement in ["^2", "not a requirement"] {
+        let cargo_home = PathBuf::from("/cargo");
+        let executable = cargo_home.join("bin/ramiz");
+        let companion = cargo_home.join("bin/git-ramiz");
+        let mut io = FakeIo {
+            cargo_home: Some(cargo_home.clone()),
+            ..FakeIo::default()
+        };
+        io.file(&executable, "old");
+        io.file(&companion, "old companion");
+        io.file(cargo_home.join(".crates.toml"), cargo_v1_manifest("1.0.0"));
+        let inconsistent = binstall_manifest("1.0.0", "test-host").replacen(
+            r#""version_req":"=1.0.0""#,
+            &format!(r#""version_req":"{requirement}""#),
+            1,
+        );
+        io.file(cargo_home.join("binstall/crates-v1.json"), inconsistent);
+        let mut service = service(io);
+        assert_eq!(
+            service
+                .run(&UpdateRequest::new(false, &executable, "1.0.0"))
+                .unwrap_err()
+                .code,
+            "unknown_installer"
+        );
+    }
+}
+
+#[test]
+fn linux_gnu_and_musl_binstall_targets_are_compatible() {
+    let cargo_home = PathBuf::from("/cargo");
+    let executable = cargo_home.join("bin/ramiz");
+    let companion = cargo_home.join("bin/git-ramiz");
+    let mut io = FakeIo {
+        cargo_home: Some(cargo_home.clone()),
+        installed_version: "1.1.0".into(),
+        ..FakeIo::default()
+    };
+    io.file(&executable, "old");
+    io.file(&companion, "old companion");
+    io.file(cargo_home.join(".crates.toml"), cargo_v1_manifest("1.0.0"));
+    io.file(
+        cargo_home.join("binstall/crates-v1.json"),
+        binstall_manifest("1.0.0", "x86_64-unknown-linux-musl"),
+    );
+    let mut service = service(io);
+    service.host = "x86_64-unknown-linux-gnu".into();
+    service.provider.metadata.host = service.host.clone();
+    let result = service
+        .run(&UpdateRequest::new(true, &executable, "1.0.0"))
+        .unwrap();
+    assert_eq!(result.installer, Installer::Cargo);
+    assert!(!result.applied);
+}
+
+#[test]
+fn cargo_binstall_failure_restores_multiline_and_stream_records() {
+    let cargo_home = PathBuf::from("/cargo");
+    let executable = cargo_home.join("bin/ramiz");
+    let companion = cargo_home.join("bin/git-ramiz");
+    let mut io = FakeIo {
+        cargo_home: Some(cargo_home.clone()),
+        fail_installer: true,
+        ..FakeIo::default()
+    };
+    io.available_commands.insert("cargo-binstall".into());
+    io.file(&executable, "old");
+    io.file(&companion, "old companion");
+    binstall_records(&mut io, &cargo_home, "1.0.0");
+    let before = io.files.clone();
+    let mut service = service(io);
+    let error = service
+        .run(&UpdateRequest::new(false, &executable, "1.0.0"))
+        .unwrap_err();
+    assert_eq!(error.code, "installer_failed");
+    assert_eq!(service.io.files, before);
+}
+
+#[test]
 fn cargo_failure_restores_both_binaries_and_install_records() {
     let cargo_home = PathBuf::from("/cargo");
     let executable = cargo_home.join("bin/ramiz");
     let companion = cargo_home.join("bin/git-ramiz");
-    let record = cargo_home.join(".crates2.json");
     let mut io = FakeIo {
         cargo_home: Some(cargo_home.clone()),
         fail_installer: true,
@@ -363,7 +730,7 @@ fn cargo_failure_restores_both_binaries_and_install_records() {
     };
     io.file(&executable, "old");
     io.file(&companion, "old companion");
-    io.file(&record, r#"{"ramiz 1.0.0":{"bins":["ramiz","git-ramiz"]}}"#);
+    legacy_cargo_records(&mut io, &cargo_home, "1.0.0");
     let before = io.files.clone();
     let mut service = service(io);
     let error = service
@@ -388,7 +755,7 @@ fn unrelated_cargo_install_change_is_not_clobbered() {
     };
     io.file(&executable, "old");
     io.file(&companion, "old companion");
-    io.file(&record, r#"{"ramiz 1.0.0":{"bins":["ramiz","git-ramiz"]}}"#);
+    legacy_cargo_records(&mut io, &cargo_home, "1.0.0");
     let mut service = service(io);
     let error = service
         .run(&UpdateRequest::new(false, &executable, "1.0.0"))
@@ -397,7 +764,7 @@ fn unrelated_cargo_install_change_is_not_clobbered() {
     assert!(error.rollback.is_none());
     assert_eq!(
         service.io.files.get(&record).unwrap(),
-        br#"{"ramiz 1.0.0":{"bins":["ramiz","git-ramiz"]},"other 1.0.0":{"bins":["other"]}}"#
+        br#"{"installs":{"ramiz 1.1.0 (registry+https://github.com/rust-lang/crates.io-index)":{"bins":["ramiz","git-ramiz"]},"other 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)":{"bins":["other"]}}}"#
     );
     assert_eq!(service.io.files.get(&executable).unwrap(), b"old");
     assert_eq!(service.io.files.get(&companion).unwrap(), b"old companion");
@@ -415,10 +782,7 @@ fn cargo_fallback_is_locked_and_exact() {
     };
     io.file(&executable, "old");
     io.file(&companion, "old");
-    io.file(
-        cargo_home.join(".crates2.json"),
-        r#"{"ramiz 1.0.0":{"bins":["ramiz","git-ramiz"]}}"#,
-    );
+    legacy_cargo_records(&mut io, &cargo_home, "1.0.0");
     let mut service = service(io);
     let result = service
         .run(&UpdateRequest::new(false, &executable, "1.0.0"))
@@ -450,10 +814,7 @@ fn cargo_record_version_must_match_installed_binary_version() {
     };
     io.file(&executable, "old");
     io.file(&companion, "old companion");
-    io.file(
-        cargo_home.join(".crates2.json"),
-        r#"{"ramiz 11.1.0":{"bins":["ramiz","git-ramiz"]}}"#,
-    );
+    legacy_cargo_records(&mut io, &cargo_home, "11.1.0");
     let mut service = service(io);
     let error = service
         .run(&UpdateRequest::new(false, &executable, "1.1.0"))
@@ -565,10 +926,7 @@ fn check_reports_availability_without_mutation() {
     };
     io.file(&executable, "old");
     io.file(&companion, "old");
-    io.file(
-        cargo_home.join(".crates2.json"),
-        r#"{"ramiz 1.0.0":{"bins":["ramiz","git-ramiz"]}}"#,
-    );
+    legacy_cargo_records(&mut io, &cargo_home, "1.0.0");
     let before = io.files.clone();
     let mut service = service(io);
     let result = service

@@ -19,7 +19,11 @@ use std::{
     time::Duration,
 };
 
-use serde::{Deserialize, Serialize, Serializer, ser::SerializeMap};
+use serde::{
+    Deserialize, Serialize, Serializer,
+    de::{self, MapAccess, Visitor},
+    ser::SerializeMap,
+};
 use sha2::{Digest, Sha256};
 
 pub const REPOSITORY: &str = "agensfield/ramiz";
@@ -1252,7 +1256,7 @@ where
 {
     pub fn run(&mut self, request: &UpdateRequest) -> Result<UpdateResult, UpdateFailure> {
         let paths = BinaryPair::from_executable(&request.executable);
-        let installer = discover_installer(&self.io, &paths.primary, &paths.secondary);
+        let installer = discover_installer(&self.io, &paths.primary, &paths.secondary, &self.host);
         if request.check {
             let (metadata, available) = self.latest(request, &paths, installer)?;
             let mut result = result_for(
@@ -1332,7 +1336,8 @@ where
             self.io.acquire_lock(&lock).map_err(|error| {
                 UpdateFailure::new("update_locked", error.to_string(), &paths.primary)
             })?;
-            if discover_installer(&self.io, &paths.primary, &paths.secondary) != Installer::Unknown
+            if discover_installer(&self.io, &paths.primary, &paths.secondary, &self.host)
+                != Installer::Unknown
                 || !self.proves_standalone(&request.current_version, &paths)
             {
                 let _ = self.io.release_lock(&lock);
@@ -1509,7 +1514,12 @@ where
             )
             .with_installer(installer));
         }
-        if !cargo_record_present(&self.io, &install_root, Some(&request.current_version)) {
+        if !cargo_record_present(
+            &self.io,
+            &install_root,
+            Some(&request.current_version),
+            &self.host,
+        ) {
             return Err(UpdateFailure::new(
                 "cargo_record_unproven",
                 "Cargo installation record does not prove that Ramiz owns this executable",
@@ -1557,7 +1567,14 @@ where
             )
             .with_installer(installer)
         })?;
-        if discover_installer(&self.io, &paths.primary, &paths.secondary) != installer {
+        if discover_installer(&self.io, &paths.primary, &paths.secondary, &self.host) != installer
+            || !cargo_record_present(
+                &self.io,
+                &install_root,
+                Some(&request.current_version),
+                &self.host,
+            )
+        {
             let _ = self.io.release_lock(&lock);
             return Err(UpdateFailure::new(
                 "installation_changed",
@@ -1586,6 +1603,15 @@ where
                 return Err(UpdateFailure::new(
                     "installer_failed",
                     process_failure(&output),
+                    &paths.primary,
+                )
+                .with_installer(installer)
+                .with_command(command.clone()));
+            }
+            if !cargo_record_present(&self.io, &install_root, Some(&metadata.version), &self.host) {
+                return Err(UpdateFailure::new(
+                    "cargo_record_unproven",
+                    "installer did not leave a consistent Ramiz ownership record",
                     &paths.primary,
                 )
                 .with_installer(installer)
@@ -1719,7 +1745,7 @@ where
             )
             .with_installer(installer)
         })?;
-        if discover_installer(&self.io, &paths.primary, &paths.secondary) != installer {
+        if discover_installer(&self.io, &paths.primary, &paths.secondary, &self.host) != installer {
             let _ = self.io.release_lock(&lock);
             return Err(UpdateFailure::new(
                 "installation_changed",
@@ -2010,14 +2036,19 @@ impl BinaryPair {
     }
 }
 
-fn discover_installer<I: UpdateIo>(io: &I, executable: &Path, secondary: &Path) -> Installer {
+fn discover_installer<I: UpdateIo>(
+    io: &I,
+    executable: &Path,
+    secondary: &Path,
+    host: &str,
+) -> Installer {
     let resolved = io
         .canonicalize(executable)
         .unwrap_or_else(|_| executable.to_path_buf());
     if is_homebrew_path(&resolved) {
         return Installer::Homebrew;
     }
-    if cargo_owned(io, executable, &resolved) {
+    if cargo_owned(io, executable, &resolved, host) {
         return Installer::Cargo;
     }
     for receipt in receipt_paths(executable) {
@@ -2106,7 +2137,7 @@ fn is_homebrew_path(path: &Path) -> bool {
     false
 }
 
-fn cargo_owned<I: UpdateIo>(io: &I, executable: &Path, resolved: &Path) -> bool {
+fn cargo_owned<I: UpdateIo>(io: &I, executable: &Path, resolved: &Path, host: &str) -> bool {
     let Some(cargo_home) = io.cargo_home() else {
         return false;
     };
@@ -2116,87 +2147,311 @@ fn cargo_owned<I: UpdateIo>(io: &I, executable: &Path, resolved: &Path) -> bool 
         .join(executable.file_name().unwrap_or_default());
     let expected = io.canonicalize(&expected).unwrap_or(expected);
     (resolved == expected || executable == expected)
-        && cargo_record_present(io, &install_root, None)
+        && cargo_record_present(io, &install_root, None, host)
 }
 
-fn cargo_record_present<I: UpdateIo>(io: &I, install_root: &Path, version: Option<&str>) -> bool {
-    let Ok(record) = io.read_string(&install_root.join(".crates2.json")) else {
-        return false;
+fn cargo_record_present<I: UpdateIo>(
+    io: &I,
+    install_root: &Path,
+    version: Option<&str>,
+    host: &str,
+) -> bool {
+    let cargo_v1 = match read_manager_record(io, &install_root.join(".crates.toml")) {
+        Ok(Some(record)) => match parse_cargo_v1_record(&record) {
+            Ok(Some(record)) => record,
+            _ => return false,
+        },
+        _ => return false,
     };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&record) else {
+    if version.is_some_and(|version| cargo_v1.version.to_string() != version) {
         return false;
-    };
-    json_has_cargo_install(&value, version)
-}
-
-fn json_has_cargo_install(value: &serde_json::Value, version: Option<&str>) -> bool {
-    match value {
-        serde_json::Value::Object(object) => object.iter().any(|(key, value)| {
-            if version.map_or_else(
-                || key.starts_with("ramiz "),
-                |version| {
-                    key.as_str() == format!("ramiz {version}")
-                        || key.starts_with(&format!("ramiz {version} ("))
-                },
-            ) {
-                !key.contains("git+")
-                    && !key.contains("path+")
-                    && !key.contains("private")
-                    && cargo_record_entry_ok(value)
-            } else {
-                json_has_cargo_install(value, version)
-            }
-        }),
-        serde_json::Value::Array(values) => values
-            .iter()
-            .any(|value| json_has_cargo_install(value, version)),
-        _ => false,
     }
-}
 
-fn unrelated_cargo_json_equal(baseline: &[u8], current: &[u8]) -> bool {
-    let Ok(mut baseline) = serde_json::from_slice::<serde_json::Value>(baseline) else {
-        return false;
+    let legacy = match read_manager_record(io, &install_root.join(".crates2.json")) {
+        Ok(Some(record)) => match parse_legacy_cargo_record(&record) {
+            Ok(record) => record,
+            Err(()) => return false,
+        },
+        Ok(None) => None,
+        Err(()) => return false,
     };
-    let Ok(mut current) = serde_json::from_slice::<serde_json::Value>(current) else {
-        return false;
+    let binstall = match read_manager_record(io, &install_root.join("binstall/crates-v1.json")) {
+        Ok(Some(record)) => match parse_binstall_record(&record, host) {
+            Ok(record) => record,
+            Err(()) => return false,
+        },
+        Ok(None) => None,
+        Err(()) => return false,
     };
-    strip_ramiz_entries(&mut baseline);
-    strip_ramiz_entries(&mut current);
-    baseline == current
-}
 
-fn strip_ramiz_entries(value: &mut serde_json::Value) {
-    match value {
-        serde_json::Value::Object(object) => {
-            object.retain(|key, _| !key.starts_with("ramiz "));
-            for value in object.values_mut() {
-                strip_ramiz_entries(value);
-            }
-        }
-        serde_json::Value::Array(values) => {
-            for value in values {
-                strip_ramiz_entries(value);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn cargo_record_entry_ok(value: &serde_json::Value) -> bool {
-    let Some(object) = value.as_object() else {
-        return false;
-    };
-    if let Some(source) = object.get("source").and_then(serde_json::Value::as_str) {
-        if !source.is_empty() && source != "registry+https://github.com/rust-lang/crates.io-index" {
+    // `.crates.toml` is Cargo's authoritative installed-bin inventory. A
+    // successful cross-installer transition can leave the previous detailed
+    // record behind, so an older corroborator is tolerated only when another
+    // detailed record proves the authoritative version. A newer record is
+    // never stale evidence we can safely ignore.
+    let mut corroborated = false;
+    for record in [legacy.as_ref(), binstall.as_ref()].into_iter().flatten() {
+        if record.version > cargo_v1.version {
             return false;
         }
+        if record.version == cargo_v1.version {
+            corroborated = true;
+        }
     }
-    let Some(bins) = object.get("bins").and_then(serde_json::Value::as_array) else {
+    corroborated
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ManagedRecord {
+    version: semver::Version,
+}
+
+fn read_manager_record<I: UpdateIo>(io: &I, path: &Path) -> Result<Option<Vec<u8>>, ()> {
+    match io.read_file(path) {
+        Ok(record) => Ok(Some(record)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(()),
+    }
+}
+
+fn parse_cargo_v1_record(record: &[u8]) -> Result<Option<ManagedRecord>, ()> {
+    let record = std::str::from_utf8(record).map_err(|_| ())?;
+    let value = toml::from_str::<toml::Value>(record).map_err(|_| ())?;
+    let Some(entries) = value.get("v1").and_then(toml::Value::as_table) else {
+        return Ok(None);
+    };
+    let mut found = None;
+    for (key, value) in entries {
+        let Some(version) = cargo_record_key_version(key)? else {
+            continue;
+        };
+        if found.is_some()
+            || !value
+                .as_array()
+                .is_some_and(|bins| toml_bins_are_dual(bins))
+        {
+            return Err(());
+        }
+        found = Some(ManagedRecord {
+            version: semver::Version::parse(version).map_err(|_| ())?,
+        });
+    }
+    Ok(found)
+}
+
+#[derive(Deserialize)]
+struct CargoInstallManifest {
+    #[serde(deserialize_with = "deserialize_unique_entries")]
+    installs: Vec<(String, serde_json::Value)>,
+}
+
+fn deserialize_unique_entries<'de, D>(
+    deserializer: D,
+) -> Result<Vec<(String, serde_json::Value)>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct UniqueEntriesVisitor;
+
+    impl<'de> Visitor<'de> for UniqueEntriesVisitor {
+        type Value = Vec<(String, serde_json::Value)>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a Cargo install record map with unique package identifiers")
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut entries = Vec::new();
+            let mut names = BTreeSet::new();
+            while let Some((name, value)) = map.next_entry::<String, serde_json::Value>()? {
+                if !names.insert(name.clone()) {
+                    return Err(de::Error::custom(format!(
+                        "duplicate Cargo package identifier {name}"
+                    )));
+                }
+                entries.push((name, value));
+            }
+            Ok(entries)
+        }
+    }
+
+    deserializer.deserialize_map(UniqueEntriesVisitor)
+}
+
+fn cargo_record_key_version(key: &str) -> Result<Option<&str>, ()> {
+    let Some(rest) = key.strip_prefix("ramiz ") else {
+        return Ok(None);
+    };
+    let version = [
+        " (registry+https://github.com/rust-lang/crates.io-index)",
+        " (sparse+https://index.crates.io/)",
+    ]
+    .iter()
+    .find_map(|suffix| rest.strip_suffix(suffix))
+    .ok_or(())?;
+    semver::Version::parse(version).map_err(|_| ())?;
+    Ok(Some(version))
+}
+
+fn parse_legacy_cargo_record(record: &[u8]) -> Result<Option<ManagedRecord>, ()> {
+    let manifest = serde_json::from_slice::<CargoInstallManifest>(record).map_err(|_| ())?;
+    let mut found = None;
+    for (key, value) in manifest.installs {
+        let Some(record_version) = cargo_record_key_version(&key)? else {
+            continue;
+        };
+        if found.is_some()
+            || !value
+                .as_object()
+                .is_some_and(|object| json_bins_are_dual(object.get("bins")))
+        {
+            return Err(());
+        }
+        found = Some(ManagedRecord {
+            version: semver::Version::parse(record_version).map_err(|_| ())?,
+        });
+    }
+    Ok(found)
+}
+
+fn toml_bins_are_dual(bins: &[toml::Value]) -> bool {
+    let bins: BTreeSet<&str> = bins.iter().filter_map(toml::Value::as_str).collect();
+    bins.contains("ramiz") && bins.contains("git-ramiz")
+}
+
+fn parse_binstall_record(record: &[u8], host: &str) -> Result<Option<ManagedRecord>, ()> {
+    let stream = serde_json::Deserializer::from_slice(record).into_iter::<serde_json::Value>();
+    let mut found = None;
+    for item in stream {
+        let value = item.map_err(|_| ())?;
+        let object = value.as_object().ok_or(())?;
+        let Some(name) = object.get("name").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        if name != "ramiz" {
+            continue;
+        }
+        if found.is_some() {
+            return Err(());
+        }
+        let current = object
+            .get("current_version")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(())?;
+        let version_req = object
+            .get("version_req")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(())?;
+        let target = object
+            .get("target")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(())?;
+        let current = semver::Version::parse(current).map_err(|_| ())?;
+        let version_req = semver::VersionReq::parse(version_req).map_err(|_| ())?;
+        if !binstall_entry_is_crates_io(object)
+            || !version_req.matches(&current)
+            || !json_bins_are_dual(object.get("bins"))
+            || !binstall_target_compatible(target, host)
+        {
+            return Err(());
+        }
+        found = Some(ManagedRecord { version: current });
+    }
+    Ok(found)
+}
+
+fn binstall_entry_is_crates_io(object: &serde_json::Map<String, serde_json::Value>) -> bool {
+    let Some(source) = object.get("source").and_then(serde_json::Value::as_object) else {
+        return false;
+    };
+    let kind = source
+        .get("source_type")
+        .and_then(serde_json::Value::as_str);
+    let url = source.get("url").and_then(serde_json::Value::as_str);
+    matches!(
+        (kind, url),
+        (
+            Some("Registry"),
+            Some("https://github.com/rust-lang/crates.io-index")
+        ) | (
+            Some("Sparse"),
+            Some("https://index.crates.io/" | "sparse+https://index.crates.io/")
+        )
+    )
+}
+
+fn binstall_target_compatible(recorded: &str, host: &str) -> bool {
+    if recorded == host {
+        return true;
+    }
+    for arch in ["aarch64", "x86_64"] {
+        let gnu = format!("{arch}-unknown-linux-gnu");
+        let musl = format!("{arch}-unknown-linux-musl");
+        if (recorded == gnu || recorded == musl) && (host == gnu || host == musl) {
+            return true;
+        }
+    }
+    false
+}
+
+fn json_bins_are_dual(value: Option<&serde_json::Value>) -> bool {
+    let Some(bins) = value.and_then(serde_json::Value::as_array) else {
         return false;
     };
     let bins: BTreeSet<&str> = bins.iter().filter_map(serde_json::Value::as_str).collect();
     bins.contains("ramiz") && bins.contains("git-ramiz")
+}
+
+fn unrelated_legacy_cargo_record(
+    record: Option<&[u8]>,
+) -> Option<Vec<(String, serde_json::Value)>> {
+    let Some(record) = record else {
+        return Some(Vec::new());
+    };
+    let mut manifest = serde_json::from_slice::<CargoInstallManifest>(record).ok()?;
+    manifest
+        .installs
+        .retain(|(key, _)| !key.starts_with("ramiz "));
+    Some(manifest.installs)
+}
+
+fn unrelated_binstall_record(record: Option<&[u8]>) -> Option<Vec<serde_json::Value>> {
+    let Some(record) = record else {
+        return Some(Vec::new());
+    };
+    let mut values = Vec::new();
+    for item in serde_json::Deserializer::from_slice(record).into_iter::<serde_json::Value>() {
+        let value = item.ok()?;
+        if value.get("name").and_then(serde_json::Value::as_str) != Some("ramiz") {
+            values.push(value);
+        }
+    }
+    Some(values)
+}
+
+fn unrelated_cargo_v1_record(record: Option<&[u8]>) -> Option<Option<toml::Value>> {
+    let Some(record) = record else {
+        return Some(None);
+    };
+    let text = std::str::from_utf8(record).ok()?;
+    let mut value = toml::from_str::<toml::Value>(text).ok()?;
+    if let Some(entries) = value.get_mut("v1").and_then(toml::Value::as_table_mut) {
+        entries.retain(|key, _| !key.starts_with("ramiz "));
+    }
+    Some(prune_empty_toml(value))
+}
+
+fn prune_empty_toml(mut value: toml::Value) -> Option<toml::Value> {
+    if let toml::Value::Table(table) = &mut value {
+        table.retain(|_, value| prune_empty_toml(value.clone()).is_some());
+        if table.is_empty() {
+            return None;
+        }
+    }
+    Some(value)
 }
 
 fn receipt_paths(executable: &Path) -> [PathBuf; 1] {
@@ -2363,7 +2618,7 @@ fn snapshot_optional<I: UpdateIo>(io: &I, path: &Path) -> Result<Option<Vec<u8>>
 
 struct CargoBackup {
     binaries: [(PathBuf, Option<Vec<u8>>); 2],
-    records: [(PathBuf, Option<Vec<u8>>); 2],
+    records: Vec<(PathBuf, Option<Vec<u8>>)>,
 }
 
 impl CargoBackup {
@@ -2372,18 +2627,6 @@ impl CargoBackup {
         paths: &BinaryPair,
         install_root: &Path,
     ) -> Result<Self, UpdateFailure> {
-        if snapshot_optional(io, &install_root.join(".crates2.json"))
-            .map_err(|error| {
-                UpdateFailure::new("cargo_snapshot_failed", error.to_string(), install_root)
-            })?
-            .is_none()
-        {
-            return Err(UpdateFailure::new(
-                "cargo_record_unproven",
-                "Cargo .crates2.json record is required",
-                install_root,
-            ));
-        }
         let primary = snapshot_optional(io, &paths.primary).map_err(|error| {
             UpdateFailure::new("cargo_snapshot_failed", error.to_string(), &paths.primary)
         })?;
@@ -2393,8 +2636,9 @@ impl CargoBackup {
         let record_paths = [
             install_root.join(".crates2.json"),
             install_root.join(".crates.toml"),
+            install_root.join("binstall/crates-v1.json"),
         ];
-        let records = record_paths.map(|path| {
+        let records = record_paths.into_iter().map(|path| {
             let contents = snapshot_optional(io, &path).map_err(|error| {
                 UpdateFailure::new("cargo_snapshot_failed", error.to_string(), &path)
             })?;
@@ -2405,11 +2649,35 @@ impl CargoBackup {
                 (paths.primary.clone(), primary),
                 (paths.secondary.clone(), secondary),
             ],
-            records: [records[0].clone()?, records[1].clone()?],
+            records: records.collect::<Result<Vec<_>, UpdateFailure>>()?,
         })
     }
 
     fn restore<I: UpdateIo>(&self, io: &mut I) -> Result<(), io::Error> {
+        for (path, baseline) in &self.records {
+            let current = snapshot_optional(io, path)?;
+            let baseline = baseline.as_deref();
+            let current = current.as_deref();
+            let unrelated_equal = if path.ends_with(".crates2.json") {
+                unrelated_legacy_cargo_record(baseline)
+                    .zip(unrelated_legacy_cargo_record(current))
+                    .is_some_and(|(baseline, current)| baseline == current)
+            } else if path.ends_with("crates-v1.json") {
+                unrelated_binstall_record(baseline)
+                    .zip(unrelated_binstall_record(current))
+                    .is_some_and(|(baseline, current)| baseline == current)
+            } else {
+                unrelated_cargo_v1_record(baseline)
+                    .zip(unrelated_cargo_v1_record(current))
+                    .is_some_and(|(baseline, current)| baseline == current)
+            };
+            if !unrelated_equal {
+                return Err(io::Error::other(format!(
+                    "unrelated Cargo installation changed: {}",
+                    path.display()
+                )));
+            }
+        }
         for (path, bytes) in &self.binaries {
             match bytes {
                 Some(bytes) => {
@@ -2417,27 +2685,6 @@ impl CargoBackup {
                     io.set_executable(path)?;
                 }
                 None => io.remove_file(path)?,
-            }
-        }
-        if let (Some(Some(baseline)), Some(current)) = (
-            self.records
-                .iter()
-                .find(|(path, _)| path.ends_with(".crates2.json"))
-                .map(|(_, bytes)| bytes),
-            snapshot_optional(
-                io,
-                &self
-                    .records
-                    .iter()
-                    .find(|(path, _)| path.ends_with(".crates2.json"))
-                    .unwrap()
-                    .0,
-            )?,
-        ) {
-            if !unrelated_cargo_json_equal(baseline, &current) {
-                return Err(io::Error::other(
-                    "unrelated Cargo installation changed while updating",
-                ));
             }
         }
         for (path, bytes) in &self.records {
