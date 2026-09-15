@@ -117,7 +117,7 @@ jobs:
           printf '%s\n' "$doctor" | jq -e '.data.path.display and (.data.path.bytes_base64 | length > 0)'
           repo="$RUNNER_TEMP/ramiz-native-smoke"
           mkdir -p "$repo"
-          git -C "$repo" init -q
+          git -C "$repo" init -q -b main
           git -C "$repo" config user.name Ramiz
           git -C "$repo" config user.email ramiz@example.invalid
           printf 'native target smoke\n' > "$repo/file.txt"

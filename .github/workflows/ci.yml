@@ -72,7 +72,7 @@ jobs:
           repo="$root/repo"
           rm -rf "$root"
           mkdir -p "$repo"
-          git -C "$repo" init -q
+          git -C "$repo" init -q -b main
           git -C "$repo" config user.name Ramiz
           git -C "$repo" config user.email ramiz@example.invalid
           printf 'apfs acceptance\n' > "$repo/file.txt"
@@ -103,7 +103,7 @@ jobs:
           sudo chown "$(id -u):$(id -g)" "$mountpoint"
           repo="$mountpoint/repo"
           mkdir -p "$repo"
-          git -C "$repo" init -q
+          git -C "$repo" init -q -b main
           git -C "$repo" config user.name Ramiz
           git -C "$repo" config user.email ramiz@example.invalid
           printf 'ficlone acceptance\n' > "$repo/file.txt"

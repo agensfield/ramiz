@@ -62,7 +62,7 @@ fn ramiz(cwd: &Path, args: &[&str]) -> Output {
 
 fn init_repo(root: &Path) -> PathBuf {
     let repo = root.join("repo");
-    git(root, &["init", "-q", repo.to_str().unwrap()]);
+    git(root, &["init", "-q", "-b", "main", repo.to_str().unwrap()]);
     git(&repo, &["config", "user.name", "Ramiz Test"]);
     git(&repo, &["config", "user.email", "ramiz@example.invalid"]);
     repo
