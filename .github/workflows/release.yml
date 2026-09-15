@@ -358,25 +358,28 @@ jobs:
       contents: read
     env:
       RELEASE_VERSION: ${{ needs.source.outputs.version }}
-      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ needs.source.outputs.commit }}
           persist-credentials: false
-      - name: Download exact draft Linux archive
-        run: gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --dir dist/draft --pattern "ramiz_${RELEASE_VERSION}_linux_amd64.tar.gz"
+      - name: Download exact signed Linux archive
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ramiz-signed-${{ needs.source.outputs.commit }}
+          path: dist/signed
       - name: Install cargo-binstall
         run: cargo install cargo-binstall --version 1.23.0 --locked
-      - name: Install both binaries through cargo-binstall from draft bytes
+      - name: Install both binaries through cargo-binstall from signed bytes
         shell: bash
         run: |
-          python3 -m http.server 8765 --directory dist/draft >/tmp/ramiz-binstall-http.log 2>&1 &
+          python3 -m http.server 8765 --bind 127.0.0.1 --directory dist/signed >/tmp/ramiz-binstall-http.log 2>&1 &
           server=$!
           trap 'kill "$server"' EXIT
-          cargo binstall --no-confirm --force --targets x86_64-unknown-linux-musl --pkg-url "http://127.0.0.1:8765/ramiz_${RELEASE_VERSION}_linux_amd64.tar.gz" "ramiz@$RELEASE_VERSION"
+          cargo binstall --no-confirm --force --allow-insecure-http --targets x86_64-unknown-linux-musl --pkg-url "http://127.0.0.1:8765/ramiz_${RELEASE_VERSION}_linux_amd64.tar.gz" "ramiz@$RELEASE_VERSION"
           test "$(ramiz --version)" = "ramiz $RELEASE_VERSION"
           test "$(git-ramiz --version)" = "ramiz $RELEASE_VERSION"
+          test "$(git ramiz --version)" = "ramiz $RELEASE_VERSION"
 
   cargo-update:
     needs: [source, publish-crate]
