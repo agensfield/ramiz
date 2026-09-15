@@ -45,7 +45,7 @@ jobs:
         shell: bash
         run: |
           version="$(awk -F'"' '/^version = "/ { print $2; exit }' Cargo.toml)"
-          target="$(rustc +1.85.0 -vV | awk '/^host:/ { print $2; exit }')"
+          target="$(rustc +1.85.0 -vV | awk '/^host:/ { print $2 }')"
           commit="$(git rev-parse HEAD)"
           binary_dir=target/release
           if [ "$RUNNER_OS" = Linux ]; then

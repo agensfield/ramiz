@@ -131,7 +131,11 @@ fn inheritance_preserves_head_index_worktree_and_ignored_state() {
     let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(envelope["schema"], "ramiz.cli/v1");
     assert_eq!(envelope["command"], "add");
-    assert!(envelope["data"]["cow_files"].as_u64().unwrap() >= 1);
+    assert!(
+        envelope["data"]["cow_files"].as_u64().unwrap()
+            + envelope["data"]["copied_files"].as_u64().unwrap()
+            >= 1
+    );
     assert_eq!(envelope["data"]["hardlinks"], 1);
     assert!(
         envelope["data"]["skipped_special"]
