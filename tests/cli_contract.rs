@@ -41,7 +41,7 @@ fn both_invocation_binaries_report_the_same_version() {
     assert_eq!(direct.stdout, git_extension.stdout);
     assert_eq!(
         String::from_utf8(direct.stdout).unwrap().trim(),
-        "ramiz 1.0.0"
+        format!("ramiz {}", env!("CARGO_PKG_VERSION"))
     );
 
     let extension_dir = std::path::Path::new(env!("CARGO_BIN_EXE_git-ramiz"))

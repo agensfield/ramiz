@@ -23,7 +23,6 @@ jobs:
       version: ${{ steps.source.outputs.version }}
       commit: ${{ steps.source.outputs.commit }}
       prerelease: ${{ steps.source.outputs.prerelease }}
-      reuse_draft: ${{ steps.draft.outputs.reuse_draft }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -53,22 +52,6 @@ jobs:
         run: |
           count="$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$GITHUB_SHA&status=completed" --jq '[.workflow_runs[] | select(.head_sha == "'"$GITHUB_SHA"'" and .conclusion == "success")] | length')"
           test "$count" -ge 1
-      - name: Detect existing exact draft release
-        id: draft
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          existing="$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq '.[] | select(.tag_name == "'"$GITHUB_REF_NAME"'") | [.id, .draft] | @tsv' | head -n 1)"
-          if [ -z "$existing" ]; then
-            printf 'reuse_draft=false\n' >> "$GITHUB_OUTPUT"
-          else
-            id="${existing%%$'\t'*}"
-            draft="${existing#*$'\t'}"
-            test "$draft" = true
-            printf 'reuse_draft=true\n' >> "$GITHUB_OUTPUT"
-            printf 'existing_release_id=%s\n' "$id" >> "$GITHUB_OUTPUT"
-          fi
-
   build:
     needs: source
     strategy:
@@ -227,6 +210,32 @@ jobs:
           ref: ${{ needs.source.outputs.commit }}
           fetch-depth: 0
           persist-credentials: false
+      - name: Detect exact release with draft-visible authority
+        id: release
+        shell: bash
+        run: |
+          classify() {
+            if [ "$#" -eq 0 ]; then printf 'create\n'; return; fi
+            if [ "$#" -ne 2 ]; then return 2; fi
+            if [ "$1" = true ] || [ "$2" = true ]; then printf 'reuse\n'; else printf 'refuse\n'; fi
+          }
+          test "$(classify)" = create
+          test "$(classify true false)" = reuse
+          test "$(classify false true)" = reuse
+          test "$(classify false false)" = refuse
+          existing="$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq '.[] | select(.tag_name == "'"$GITHUB_REF_NAME"'") | [.id, .draft, .prerelease] | @tsv' | head -n 1)"
+          if [ -z "$existing" ]; then
+            state="$(classify)"
+          else
+            id="${existing%%$'\t'*}"
+            fields="${existing#*$'\t'}"
+            draft="${fields%%$'\t'*}"
+            prerelease="${fields#*$'\t'}"
+            state="$(classify "$draft" "$prerelease")"
+            printf 'existing_release_id=%s\n' "$id" >> "$GITHUB_OUTPUT"
+          fi
+          test "$state" != refuse
+          printf 'reuse_release=%s\n' "$([ "$state" = reuse ] && printf true || printf false)" >> "$GITHUB_OUTPUT"
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: ramiz-signed-${{ needs.source.outputs.commit }}
@@ -267,10 +276,10 @@ jobs:
             gh attestation verify "$artifact" --repo "$GITHUB_REPOSITORY" --bundle dist/release/attestation.jsonl --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" --signer-digest "$RELEASE_COMMIT" --source-digest "$RELEASE_COMMIT" --source-ref "$GITHUB_REF" --deny-self-hosted-runners
           done
       - name: Create complete draft release
-        if: needs.source.outputs.reuse_draft != 'true'
+        if: steps.release.outputs.reuse_release != 'true'
         run: gh release create "$GITHUB_REF_NAME" dist/release/ramiz_*.tar.gz dist/release/checksums.txt dist/release/checksums.txt.minisig dist/release/attestation.jsonl --repo "$GITHUB_REPOSITORY" --verify-tag --target "$RELEASE_COMMIT" --title "Ramiz $GITHUB_REF_NAME" --generate-notes --draft --prerelease="$RELEASE_PRERELEASE" --latest=false
-      - name: Verify and reuse existing exact draft release
-        if: needs.source.outputs.reuse_draft == 'true'
+      - name: Verify and reuse existing exact resumable release
+        if: steps.release.outputs.reuse_release == 'true'
         shell: bash
         run: |
           mkdir -p dist/existing-draft
@@ -281,7 +290,7 @@ jobs:
           cmp dist/release/checksums.txt dist/existing-draft/checksums.txt
           cmp dist/release/checksums.txt.minisig dist/existing-draft/checksums.txt.minisig
           for artifact in dist/existing-draft/ramiz_*.tar.gz dist/existing-draft/checksums.txt dist/existing-draft/checksums.txt.minisig; do gh attestation verify "$artifact" --repo "$GITHUB_REPOSITORY" --bundle dist/existing-draft/attestation.jsonl --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" --signer-digest "$RELEASE_COMMIT" --source-digest "$RELEASE_COMMIT" --source-ref "$GITHUB_REF" --deny-self-hosted-runners; done
-      - name: Verify downloaded draft assets before crate publication
+      - name: Verify downloaded release assets before crate publication
         shell: bash
         run: |
           mkdir -p dist/downloaded
@@ -380,6 +389,8 @@ jobs:
           test "$(ramiz --version)" = "ramiz $RELEASE_VERSION"
           test "$(git-ramiz --version)" = "ramiz $RELEASE_VERSION"
           test "$(git ramiz --version)" = "ramiz $RELEASE_VERSION"
+      - name: Recognize an actual public v1.0.0 cargo-binstall installation
+        run: cargo test --locked --test update_acceptance binstall_release_recognizes_the_actual_previous_public_installation -- --ignored --exact --nocapture
 
   cargo-update:
     needs: [source, publish-crate]
@@ -395,7 +406,7 @@ jobs:
       - name: Install exact MSRV toolchain
         run: rustup toolchain install 1.85.0 --profile minimal --no-self-update
       - name: Exercise real Cargo managed bootstrap update
-        run: cargo +1.85.0 test --locked --test update_acceptance cargo_release_bootstrap_uses_real_install_and_records_both_bins -- --ignored --exact --nocapture
+        run: cargo +1.85.0 test --locked --test update_acceptance cargo_release_updates_the_actual_previous_public_release -- --ignored --exact --nocapture
 
   publish:
     needs: [source, draft, publish-crate, binstall, cargo-update]

@@ -29,6 +29,7 @@ use update::{
 const COMMIT: &str = "0000000000000000000000000000000000000000";
 const TEST_PUBLIC_KEY: &str = include_str!("fixtures/update-test.pub");
 const TEST_SECRET_KEY: &str = include_str!("fixtures/update-test.key");
+const CANDIDATE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const HOST: &str = "aarch64-apple-darwin";
@@ -217,9 +218,9 @@ fn fixture_files(
     secret_key: &SecretKey,
 ) -> HashMap<String, Vec<u8>> {
     let old_archive = archive("0.9.0", predecessor, predecessor);
-    let new_archive = archive("1.0.0", candidate_primary, candidate_secondary);
+    let new_archive = archive(CANDIDATE_VERSION, candidate_primary, candidate_secondary);
     let mut files = HashMap::new();
-    for (version, archive) in [("0.9.0", old_archive), ("1.0.0", new_archive)] {
+    for (version, archive) in [("0.9.0", old_archive), (CANDIDATE_VERSION, new_archive)] {
         let name = archive_name(version);
         let checksums = format!("{}  {name}\n", digest(&archive)).into_bytes();
         let signature = sign_checksums(&checksums, public_key, secret_key);
@@ -229,7 +230,10 @@ fn fixture_files(
         files.insert(format!("/assets/{version}/attestation"), b"{}\n".to_vec());
     }
     files.insert("/releases/tags/v0.9.0".into(), release_json(base, "0.9.0"));
-    files.insert("/releases/latest".into(), release_json(base, "1.0.0"));
+    files.insert(
+        "/releases/latest".into(),
+        release_json(base, CANDIDATE_VERSION),
+    );
     files
 }
 
@@ -247,26 +251,32 @@ fn predecessor_pair(root: &Path) -> (PathBuf, PathBuf, Vec<u8>) {
 
 #[cfg(unix)]
 fn rollback_candidate_pair() -> (Vec<u8>, Vec<u8>) {
-    let primary = br####"#!/bin/sh
+    let primary = format!(
+        r####"#!/bin/sh
 if [ "$1" = "--version" ]; then
-    printf 'ramiz 1.0.0\n'
+    printf 'ramiz {}\n'
 else
     exit 0
 fi
-"####
-        .to_vec();
-    let secondary = br####"#!/bin/sh
+"####,
+        CANDIDATE_VERSION
+    )
+    .into_bytes();
+    let secondary = format!(
+        r####"#!/bin/sh
 case "$0" in
     *.stage*)
-        printf 'ramiz 1.0.0\n'
+        printf 'ramiz {}\n'
         ;;
     *)
-        printf 'ramiz 1.0.0\n'
+        printf 'ramiz {}\n'
         exit 42
         ;;
 esac
-"####
-        .to_vec();
+"####,
+        CANDIDATE_VERSION, CANDIDATE_VERSION
+    )
+    .into_bytes();
     (primary, secondary)
 }
 
@@ -281,8 +291,8 @@ fn signed_standalone_bootstrap_updates_the_real_pair_and_rejects_corruption() {
     let candidate_secondary = fs::read(env!("CARGO_BIN_EXE_git-ramiz")).unwrap();
     assert!(!candidate_primary.is_empty() && !candidate_secondary.is_empty());
     assert_eq!(
-        archive("1.0.0", &candidate_primary, &candidate_secondary),
-        archive("1.0.0", &candidate_primary, &candidate_secondary),
+        archive(CANDIDATE_VERSION, &candidate_primary, &candidate_secondary),
+        archive(CANDIDATE_VERSION, &candidate_primary, &candidate_secondary),
         "fixture archive packing must be reproducible"
     );
     let (public, secret) = fixture_keypair();
@@ -354,14 +364,14 @@ fn signed_standalone_bootstrap_updates_the_real_pair_and_rejects_corruption() {
     assert_eq!(updated.installer, update::Installer::Standalone);
     assert_eq!(fs::read(&primary).unwrap(), candidate_primary);
     assert_eq!(fs::read(&secondary).unwrap(), candidate_secondary);
-    assert!(String::from_utf8_lossy(&fs::read(&marker).unwrap()).contains("1.0.0"));
+    assert!(String::from_utf8_lossy(&fs::read(&marker).unwrap()).contains(CANDIDATE_VERSION));
     assert_eq!(
         Command::new(&primary)
             .arg("--version")
             .output()
             .unwrap()
             .stdout,
-        b"ramiz 1.0.0\n"
+        format!("ramiz {CANDIDATE_VERSION}\n").as_bytes()
     );
     assert_eq!(
         Command::new(&secondary)
@@ -369,7 +379,7 @@ fn signed_standalone_bootstrap_updates_the_real_pair_and_rejects_corruption() {
             .output()
             .unwrap()
             .stdout,
-        b"ramiz 1.0.0\n"
+        format!("ramiz {CANDIDATE_VERSION}\n").as_bytes()
     );
     drop(service);
     drop(fixture);
@@ -436,8 +446,18 @@ fn signed_standalone_rollback_restores_pair_and_sidecars_after_activation_failur
     assert_eq!(fs::read(&manifest).unwrap(), adopted_state[2]);
     assert_eq!(fs::read(&signature).unwrap(), adopted_state[3]);
     assert_eq!(fs::read(&marker).unwrap(), adopted_state[4]);
-    assert!(!root.join("ramiz.previous.ramiz-update-1.0.0").exists());
-    assert!(!root.join("git-ramiz.previous.ramiz-update-1.0.0").exists());
+    assert!(
+        !root
+            .join(format!("ramiz.previous.ramiz-update-{CANDIDATE_VERSION}"))
+            .exists()
+    );
+    assert!(
+        !root
+            .join(format!(
+                "git-ramiz.previous.ramiz-update-{CANDIDATE_VERSION}"
+            ))
+            .exists()
+    );
     drop(service);
     drop(fixture);
     fs::remove_dir_all(root).unwrap();
@@ -449,7 +469,7 @@ impl ReleaseProvider for CargoAcceptanceProvider {
     fn latest(&mut self, _host: &str) -> Result<ReleaseMetadata, UpdateFailure> {
         Ok(ReleaseMetadata {
             repository: update::REPOSITORY.into(),
-            version: "1.0.0".into(),
+            version: CANDIDATE_VERSION.into(),
             host: HOST.into(),
             primary_asset: "ramiz".into(),
             secondary_asset: "git-ramiz".into(),
@@ -505,45 +525,14 @@ unsafe fn restore_env(name: &str, value: Option<std::ffi::OsString>) {
 }
 
 #[test]
-#[ignore = "release-only: requires ramiz 1.0.0 to exist on crates.io"]
-fn cargo_release_bootstrap_uses_real_install_and_records_both_bins() {
+#[ignore = "release-only: requires the candidate version to exist on crates.io"]
+fn cargo_release_updates_the_actual_previous_public_release() {
+    const PREVIOUS_VERSION: &str = "1.0.0";
     let root = std::env::temp_dir().join(format!(
         "ramiz-cargo-release-acceptance-{}",
         std::process::id()
     ));
     let _ = fs::remove_dir_all(&root);
-    fs::create_dir_all(root.join("bin")).unwrap();
-    let (primary, secondary, _predecessor) = predecessor_pair(&root.join("bin"));
-    let record = root.join(".crates2.json");
-    let install_key = "ramiz 0.9.0 (registry+https://github.com/rust-lang/crates.io-index)";
-    let rustc = String::from_utf8(
-        Command::new("rustc")
-            .args(["+1.85.0", "-vV"])
-            .output()
-            .unwrap()
-            .stdout,
-    )
-    .unwrap();
-    let record_value = serde_json::json!({
-        "installs": {
-            install_key: {
-                "version_req": null,
-                "bins": ["git-ramiz", "ramiz"],
-                "features": [],
-                "all_features": false,
-                "no_default_features": false,
-                "profile": "release",
-                "target": HOST,
-                "rustc": rustc
-            }
-        }
-    });
-    fs::write(&record, serde_json::to_vec(&record_value).unwrap()).unwrap();
-    fs::write(
-        root.join(".crates.toml"),
-        format!("[v1]\n{install_key:?} = [\"git-ramiz\", \"ramiz\"]\n"),
-    )
-    .unwrap();
     let cargo_home = root.join("cargo-home");
     fs::create_dir_all(&cargo_home).unwrap();
     let restore = EnvironmentRestore {
@@ -564,12 +553,15 @@ fn cargo_release_bootstrap_uses_real_install_and_records_both_bins() {
         env::set_var("CARGO_INSTALL_ROOT", &root);
         env::set_var("PATH", filtered_path);
     }
-    let listing = Command::new("cargo")
+    let install = Command::new("cargo")
         .args([
             "+1.85.0",
             "install",
-            "--list",
-            "--offline",
+            "ramiz",
+            "--version",
+            PREVIOUS_VERSION,
+            "--locked",
+            "--force",
             "--root",
             root.to_str().unwrap(),
         ])
@@ -577,13 +569,39 @@ fn cargo_release_bootstrap_uses_real_install_and_records_both_bins() {
         .output()
         .unwrap();
     assert!(
-        listing.status.success(),
-        "Cargo 1.85 could not parse the isolated install record: {}",
-        String::from_utf8_lossy(&listing.stderr)
+        install.status.success(),
+        "Cargo 1.85 could not install public Ramiz {PREVIOUS_VERSION}: {}",
+        String::from_utf8_lossy(&install.stderr)
     );
-    let listing = String::from_utf8_lossy(&listing.stdout);
-    assert!(listing.contains("git-ramiz"));
-    assert!(listing.contains("ramiz"));
+    let primary = root.join("bin/ramiz");
+    let secondary = root.join("bin/git-ramiz");
+    assert_eq!(
+        Command::new(&primary)
+            .arg("--version")
+            .output()
+            .unwrap()
+            .stdout,
+        format!("ramiz {PREVIOUS_VERSION}\n").as_bytes()
+    );
+    assert_eq!(
+        Command::new(&secondary)
+            .arg("--version")
+            .output()
+            .unwrap()
+            .stdout,
+        format!("ramiz {PREVIOUS_VERSION}\n").as_bytes()
+    );
+    let record = root.join(".crates2.json");
+    assert!(
+        fs::read_to_string(&record)
+            .unwrap()
+            .contains(PREVIOUS_VERSION)
+    );
+    assert!(
+        fs::read_to_string(root.join(".crates.toml"))
+            .unwrap()
+            .contains(PREVIOUS_VERSION)
+    );
     let mut service = UpdateService {
         io: SystemUpdateIo,
         provider: CargoAcceptanceProvider,
@@ -591,7 +609,7 @@ fn cargo_release_bootstrap_uses_real_install_and_records_both_bins() {
         host: HOST.into(),
     };
     let result = service
-        .run(&UpdateRequest::new(false, &primary, "0.9.0"))
+        .run(&UpdateRequest::new(false, &primary, PREVIOUS_VERSION))
         .unwrap();
     assert!(result.applied);
     assert_eq!(result.commands.len(), 1);
@@ -605,12 +623,112 @@ fn cargo_release_bootstrap_uses_real_install_and_records_both_bins() {
         fs::read(root.join("bin/git-ramiz")).unwrap()
     );
     let installed_version = Command::new(&primary).arg("--version").output().unwrap();
-    assert_eq!(installed_version.stdout, b"ramiz 1.0.0\n");
+    assert_eq!(
+        installed_version.stdout,
+        format!("ramiz {CANDIDATE_VERSION}\n").as_bytes()
+    );
     let installed_companion = Command::new(&secondary).arg("--version").output().unwrap();
-    assert_eq!(installed_companion.stdout, b"ramiz 1.0.0\n");
+    assert_eq!(
+        installed_companion.stdout,
+        format!("ramiz {CANDIDATE_VERSION}\n").as_bytes()
+    );
     let records = fs::read_to_string(&record).unwrap();
-    assert!(records.contains("ramiz 1.0.0"));
+    assert!(records.contains(&format!("ramiz {CANDIDATE_VERSION}")));
     assert!(records.contains("git-ramiz"));
+    drop(service);
+    drop(restore);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+#[ignore = "release-only: downloads the previous public GitHub release"]
+fn binstall_release_recognizes_the_actual_previous_public_installation() {
+    const PREVIOUS_VERSION: &str = "1.0.0";
+    let root = std::env::temp_dir().join(format!(
+        "ramiz-binstall-release-acceptance-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    let cargo_home = root.join("cargo-home");
+    fs::create_dir_all(&cargo_home).unwrap();
+    let restore = EnvironmentRestore {
+        cargo_home: env::var_os("CARGO_HOME"),
+        cargo_install_root: env::var_os("CARGO_INSTALL_ROOT"),
+        path: env::var_os("PATH"),
+    };
+    let inherited_path = restore.path.clone().unwrap_or_default();
+    let mut paths = vec![root.join("bin")];
+    paths.extend(env::split_paths(&inherited_path));
+    // SAFETY: EnvironmentRestore restores these scoped test overrides.
+    unsafe {
+        env::set_var("CARGO_HOME", &cargo_home);
+        env::set_var("CARGO_INSTALL_ROOT", &root);
+        env::set_var("PATH", env::join_paths(paths).unwrap());
+    }
+    let install = Command::new("cargo-binstall")
+        .args([
+            "--no-confirm",
+            "--force",
+            "--targets",
+            HOST,
+            "--root",
+            root.to_str().unwrap(),
+            &format!("ramiz@{PREVIOUS_VERSION}"),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        install.status.success(),
+        "cargo-binstall could not install public Ramiz {PREVIOUS_VERSION}: {}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+    let primary = root.join("bin/ramiz");
+    let secondary = root.join("bin/git-ramiz");
+    assert!(!root.join(".crates2.json").exists());
+    assert!(
+        fs::read_to_string(root.join("binstall/crates-v1.json"))
+            .unwrap()
+            .contains(PREVIOUS_VERSION)
+    );
+    let mut service = UpdateService {
+        io: SystemUpdateIo,
+        provider: CargoAcceptanceProvider,
+        verifier: CargoAcceptanceVerifier,
+        host: HOST.into(),
+    };
+    let result = service
+        .run(&UpdateRequest::new(true, &primary, PREVIOUS_VERSION))
+        .unwrap();
+    assert_eq!(result.installer, update::Installer::Cargo);
+    assert!(result.available);
+    assert!(!result.applied);
+    assert!(result.commands.is_empty());
+    assert_eq!(
+        Command::new(&primary)
+            .arg("--version")
+            .output()
+            .unwrap()
+            .stdout,
+        format!("ramiz {PREVIOUS_VERSION}\n").as_bytes()
+    );
+    assert_eq!(
+        Command::new(&secondary)
+            .arg("--version")
+            .output()
+            .unwrap()
+            .stdout,
+        format!("ramiz {PREVIOUS_VERSION}\n").as_bytes()
+    );
+    assert!(
+        fs::read_to_string(root.join(".crates.toml"))
+            .unwrap()
+            .contains(PREVIOUS_VERSION)
+    );
+    assert!(
+        fs::read_to_string(root.join("binstall/crates-v1.json"))
+            .unwrap()
+            .contains(PREVIOUS_VERSION)
+    );
     drop(service);
     drop(restore);
     fs::remove_dir_all(root).unwrap();
