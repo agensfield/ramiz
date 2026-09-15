@@ -1,0 +1,10 @@
+Ramiz includes independently implemented work informed by the copy-on-write
+worktree machinery in Oh My Pi:
+
+    https://github.com/can1357/oh-my-pi
+    feature commit ff91512b1d2927dd4cc095240ecf63749a32fca8
+
+Oh My Pi is Copyright (c) 2025 Mario Zechner, Copyright (c) 2025-2026 Can
+Bölük, and Copyright (c) 2026 Stencil Labs, Inc., and is distributed under the
+MIT License. No Oh My Pi runtime component is bundled with Ramiz.
+

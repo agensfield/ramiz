@@ -1,0 +1,119 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust 1.85 (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install and require Rust 1.85
+        shell: bash
+        run: |
+          rustup toolchain install 1.85.0 --profile minimal --no-self-update
+          rustup component add --toolchain 1.85.0 rustfmt clippy
+          test "$(rustc +1.85.0 --version | awk '{print $2}')" = 1.85.0
+          rustup default 1.85.0
+      - name: Format
+        run: cargo +1.85.0 fmt --all -- --check
+      - name: Clippy with warnings denied
+        run: cargo +1.85.0 clippy --locked --all-targets -- -D warnings
+      - name: Tests
+        run: cargo +1.85.0 test --locked
+      - name: Build release binaries
+        run: cargo +1.85.0 build --release --locked
+      - name: Deterministic host package and dual-binary smoke
+        shell: bash
+        run: |
+          version="$(awk -F'"' '/^version = "/ { print $2; exit }' Cargo.toml)"
+          target="$(rustc +1.85.0 -vV | awk '/^host:/ { print $2; exit }')"
+          commit="$(git rev-parse HEAD)"
+          binary_dir=target/release
+          if [ "$RUNNER_OS" = Linux ]; then
+            sudo apt-get update
+            sudo apt-get install -y musl-tools
+            target=x86_64-unknown-linux-musl
+            rustup target add --toolchain 1.85.0 "$target"
+            CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc cargo +1.85.0 build --release --locked --target "$target"
+            binary_dir="target/$target/release"
+          fi
+          mkdir -p "$RUNNER_TEMP/ramiz-package-a" "$RUNNER_TEMP/ramiz-package-b"
+          ./scripts/package.sh archive --target "$target" --binary-dir "$binary_dir" --output "$RUNNER_TEMP/ramiz-package-a" --version "$version" --commit "$commit"
+          ./scripts/package.sh archive --target "$target" --binary-dir "$binary_dir" --output "$RUNNER_TEMP/ramiz-package-b" --version "$version" --commit "$commit"
+          cmp "$RUNNER_TEMP/ramiz-package-a"/ramiz_*.tar.gz "$RUNNER_TEMP/ramiz-package-b"/ramiz_*.tar.gz
+          mkdir -p "$RUNNER_TEMP/ramiz-package-smoke"
+          tar -xzf "$RUNNER_TEMP/ramiz-package-a"/ramiz_*.tar.gz -C "$RUNNER_TEMP/ramiz-package-smoke"
+          test "$("$RUNNER_TEMP/ramiz-package-smoke/ramiz" --version)" = "ramiz $version"
+          test "$("$RUNNER_TEMP/ramiz-package-smoke/git-ramiz" --version)" = "ramiz $version"
+      - name: Real APFS acceptance
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          root="$RUNNER_TEMP/ramiz-apfs"
+          repo="$root/repo"
+          rm -rf "$root"
+          mkdir -p "$repo"
+          git -C "$repo" init -q
+          git -C "$repo" config user.name Ramiz
+          git -C "$repo" config user.email ramiz@example.invalid
+          printf 'apfs acceptance\n' > "$repo/file.txt"
+          git -C "$repo" add file.txt
+          git -C "$repo" commit -qm initial
+          doctor="$(target/release/ramiz doctor --json "$repo")"
+          printf '%s\n' "$doctor" | jq -e --arg path "$repo" '.data.path.display == $path and (.data.path.bytes_base64 | length > 0) and .data.available == true and .data.backend == "apfs"'
+          result="$(cd "$repo" && "$GITHUB_WORKSPACE/target/release/ramiz" add --require-cow --json worktree)"
+          printf '%s\n' "$result" | jq -e '.data.backend == "apfs" and .data.cow_files >= 1'
+          printf 'target mutation\n' > "$repo/worktree/file.txt"
+          test "$(cat "$repo/file.txt")" = 'apfs acceptance'
+          printf 'source mutation\n' > "$repo/file.txt"
+          test "$(cat "$repo/worktree/file.txt")" = 'target mutation'
+      - name: Mounted Linux FICLONE acceptance
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y btrfs-progs
+          image="$RUNNER_TEMP/ramiz-btrfs.img"
+          mountpoint="$RUNNER_TEMP/ramiz-btrfs"
+          truncate -s 256M "$image"
+          mkfs.btrfs -f "$image"
+          mkdir -p "$mountpoint"
+          sudo mount -o loop "$image" "$mountpoint"
+          cleanup() { sudo umount "$mountpoint"; }
+          trap cleanup EXIT
+          sudo chown "$(id -u):$(id -g)" "$mountpoint"
+          repo="$mountpoint/repo"
+          mkdir -p "$repo"
+          git -C "$repo" init -q
+          git -C "$repo" config user.name Ramiz
+          git -C "$repo" config user.email ramiz@example.invalid
+          printf 'ficlone acceptance\n' > "$repo/file.txt"
+          git -C "$repo" add file.txt
+          git -C "$repo" commit -qm initial
+          doctor="$(target/release/ramiz doctor --json "$repo")"
+          printf '%s\n' "$doctor" | jq -e --arg path "$repo" '.data.path.display == $path and (.data.path.bytes_base64 | length > 0) and .data.available == true and .data.backend == "linux-reflink"'
+          result="$(cd "$repo" && "$GITHUB_WORKSPACE/target/release/ramiz" add --require-cow --json worktree)"
+          printf '%s\n' "$result" | jq -e '.data.backend == "linux-reflink" and .data.cow_files >= 1'
+          printf 'target mutation\n' > "$repo/worktree/file.txt"
+          test "$(cat "$repo/file.txt")" = 'ficlone acceptance'
+          printf 'source mutation\n' > "$repo/file.txt"
+          test "$(cat "$repo/worktree/file.txt")" = 'target mutation'

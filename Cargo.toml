@@ -1,0 +1,65 @@
+[package]
+name = "ramiz"
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "Ridiculously cheap Git worktrees using filesystem copy-on-write"
+repository = "https://github.com/agensfield/ramiz"
+homepage = "https://github.com/agensfield/ramiz"
+readme = "README.md"
+keywords = ["git", "worktree", "reflink", "apfs", "cow"]
+categories = ["command-line-utilities", "development-tools"]
+exclude = [".github/", "tests/"]
+
+[package.metadata.binstall]
+pkg-fmt = "tgz"
+bin-dir = "{ bin }{ binary-ext }"
+disabled-strategies = ["quick-install", "compile"]
+
+[package.metadata.binstall.overrides.aarch64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/ramiz_{ version }_darwin_arm64.tar.gz"
+
+[package.metadata.binstall.overrides.x86_64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/ramiz_{ version }_darwin_amd64.tar.gz"
+
+[package.metadata.binstall.overrides.aarch64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/ramiz_{ version }_linux_arm64.tar.gz"
+
+[package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/ramiz_{ version }_linux_amd64.tar.gz"
+
+[package.metadata.binstall.overrides.aarch64-unknown-linux-musl]
+pkg-url = "{ repo }/releases/download/v{ version }/ramiz_{ version }_linux_arm64.tar.gz"
+
+[package.metadata.binstall.overrides.x86_64-unknown-linux-musl]
+pkg-url = "{ repo }/releases/download/v{ version }/ramiz_{ version }_linux_amd64.tar.gz"
+
+[dependencies]
+clap = { version = "4.6.7", features = ["derive"] }
+libc = "0.2.189"
+flate2 = "1.1.10"
+minisign-verify = "0.2.5"
+semver = "1.0.27"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.11.0"
+signal-hook = "0.4.4"
+tar = { version = "0.4.46", default-features = false }
+ureq = { version = "3.4.2", features = ["json"] }
+
+[dev-dependencies]
+minisign = "0.9.1"
+
+[[bin]]
+name = "ramiz"
+path = "src/bin/ramiz.rs"
+
+[[bin]]
+name = "git-ramiz"
+path = "src/bin/git-ramiz.rs"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
