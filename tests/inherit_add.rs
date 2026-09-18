@@ -362,6 +362,7 @@ fn tracked_symlink_lands_before_read_only_directory_metadata_is_finalized() {
 }
 
 #[test]
+#[cfg(debug_assertions)]
 fn donor_head_move_with_identical_tree_aborts_and_rolls_back() {
     let fixture = Fixture::new();
     let repo = init_repo(&fixture.0);

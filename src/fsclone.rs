@@ -87,7 +87,20 @@ pub fn clone_file(source: &Path, target: &Path) -> Result<Backend, String> {
     Err("copy-on-write cloning is unsupported on this platform".into())
 }
 
-pub fn normalize_clean_file(path: &Path, executable: bool) -> Result<(), String> {
+#[cfg(unix)]
+pub fn capture_umask() -> u32 {
+    // SAFETY: Ramiz calls this once before starting materialization workers.
+    let mask = unsafe { libc::umask(0) };
+    unsafe { libc::umask(mask) };
+    mask as u32
+}
+
+#[cfg(not(unix))]
+pub fn capture_umask() -> u32 {
+    0
+}
+
+pub fn normalize_clean_file(path: &Path, executable: bool, umask: u32) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     remove_xattrs(path)?;
 
@@ -95,13 +108,8 @@ pub fn normalize_clean_file(path: &Path, executable: bool) -> Result<(), String>
     {
         use std::os::unix::fs::PermissionsExt;
 
-        // Ramiz is single-threaded while materializing. Read and immediately
-        // restore the process umask so retained files get ordinary checkout
-        // permissions instead of donor permissions.
-        let mask = unsafe { libc::umask(0) };
-        unsafe { libc::umask(mask) };
         let requested = if executable { 0o777 } else { 0o666 };
-        fs::set_permissions(path, fs::Permissions::from_mode(requested & !(mask as u32)))
+        fs::set_permissions(path, fs::Permissions::from_mode(requested & !umask))
             .map_err(|error| format!("normalize permissions on {}: {error}", path.display()))?;
     }
 

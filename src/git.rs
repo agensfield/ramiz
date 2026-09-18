@@ -1,10 +1,13 @@
 use std::{
+    collections::{BTreeMap, BTreeSet},
     ffi::{OsStr, OsString},
     fs::File,
     io::Write,
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
 };
+
+use crate::cancellation;
 
 #[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -13,6 +16,18 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 pub struct GitFailure {
     pub operation: &'static str,
     pub output: Output,
+}
+
+#[derive(Debug)]
+pub enum HashFilesError {
+    Git(GitFailure),
+    Cancelled,
+}
+
+impl From<GitFailure> for HashFilesError {
+    fn from(error: GitFailure) -> Self {
+        Self::Git(error)
+    }
 }
 
 impl std::fmt::Display for GitFailure {
@@ -515,9 +530,41 @@ fn parse_failure(message: &str) -> GitFailure {
     }
 }
 
-pub fn path_has_transform(cwd: &Path, path: &OsStr) -> Result<bool, GitFailure> {
-    let mut input = os_bytes(path).to_vec();
-    input.push(0);
+pub fn transformed_paths(cwd: &Path, paths: &[OsString]) -> Result<BTreeSet<OsString>, GitFailure> {
+    let mut transformed = BTreeSet::new();
+    if paths.is_empty() {
+        return Ok(transformed);
+    }
+    for key in ["core.autocrlf", "core.eol"] {
+        let output = command(
+            cwd,
+            &[OsStr::new("config"), OsStr::new("--get"), OsStr::new(key)],
+        )
+        .output()
+        .map_err(|error| synthetic_failure("git config lookup", error))?;
+        if output.status.success() {
+            let value = String::from_utf8_lossy(&output.stdout);
+            if !matches!(value.trim(), "" | "false" | "input" | "native") {
+                transformed.extend(paths.iter().cloned());
+                return Ok(transformed);
+            }
+        } else if output.status.code() != Some(1) {
+            return Err(GitFailure {
+                operation: "git config lookup",
+                output,
+            });
+        }
+    }
+
+    let mut input = Vec::new();
+    let expected: BTreeMap<Vec<u8>, OsString> = paths
+        .iter()
+        .map(|path| (os_bytes(path).to_vec(), path.clone()))
+        .collect();
+    for path in paths {
+        input.extend_from_slice(os_bytes(path));
+        input.push(0);
+    }
     let output = checked_with_input(
         cwd,
         "git attribute lookup",
@@ -537,64 +584,84 @@ pub fn path_has_transform(cwd: &Path, path: &OsStr) -> Result<bool, GitFailure> 
     if fields.len() % 3 != 0
         || fields
             .chunks_exact(3)
-            .any(|triple| triple[0] != os_bytes(path))
+            .any(|triple| !expected.contains_key(triple[0]))
     {
         return Err(parse_failure("malformed git check-attr -z response"));
     }
-    let transformed = fields.chunks_exact(3).any(|triple| {
-        matches!(
+    for triple in fields.chunks_exact(3) {
+        if matches!(
             triple[1],
             b"filter" | b"text" | b"eol" | b"working-tree-encoding" | b"ident"
         ) && !matches!(triple[2], b"unspecified" | b"unset")
-    });
-    if transformed {
-        return Ok(true);
-    }
-    for key in ["core.autocrlf", "core.eol"] {
-        let output = command(
-            cwd,
-            &[OsStr::new("config"), OsStr::new("--get"), OsStr::new(key)],
-        )
-        .output()
-        .map_err(|error| synthetic_failure("git config lookup", error))?;
-        if output.status.success() {
-            let value = String::from_utf8_lossy(&output.stdout);
-            if !matches!(value.trim(), "" | "false" | "input" | "native") {
-                return Ok(true);
-            }
+        {
+            transformed.insert(expected[triple[0]].clone());
         }
     }
-    Ok(false)
+    Ok(transformed)
 }
 
-pub fn hash_file(cwd: &Path, path: &Path) -> Result<String, GitFailure> {
-    let mut child = command(
-        cwd,
-        &[
-            OsStr::new("hash-object"),
-            OsStr::new("--no-filters"),
-            OsStr::new("--stdin"),
-        ],
-    )
-    .stdin(Stdio::piped())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped())
-    .spawn()
-    .map_err(|error| synthetic_failure("git hash-object", error))?;
-    let mut file = File::open(path).map_err(|error| synthetic_failure("git hash-object", error))?;
-    std::io::copy(&mut file, child.stdin.as_mut().expect("piped stdin"))
-        .map_err(|error| synthetic_failure("git hash-object", error))?;
-    drop(child.stdin.take());
-    let output = child
-        .wait_with_output()
-        .map_err(|error| synthetic_failure("git hash-object", error))?;
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
-    } else {
-        Err(GitFailure {
-            operation: "git hash-object",
-            output,
-        })
+pub fn hash_files(cwd: &Path, paths: &[PathBuf]) -> Result<Vec<String>, HashFilesError> {
+    const MAX_PATHS: usize = 128;
+    const MAX_ARG_BYTES: usize = 60 * 1024;
+
+    let mut hashes = Vec::with_capacity(paths.len());
+    let mut start = 0;
+    while start < paths.len() {
+        if cancellation::requested() {
+            return Err(HashFilesError::Cancelled);
+        }
+        let mut end = start;
+        let mut arg_bytes = 0;
+        while end < paths.len() && end - start < MAX_PATHS {
+            let path_bytes = os_bytes(paths[end].as_os_str()).len() + 1;
+            if end > start && arg_bytes + path_bytes > MAX_ARG_BYTES {
+                break;
+            }
+            arg_bytes += path_bytes;
+            end += 1;
+        }
+        let mut args = Vec::with_capacity(end - start + 3);
+        args.push(OsStr::new("hash-object"));
+        args.push(OsStr::new("--no-filters"));
+        args.push(OsStr::new("--"));
+        args.extend(paths[start..end].iter().map(|path| path.as_os_str()));
+        let output = checked(cwd, "git hash-object", &args)?;
+        let batch: Vec<String> = output
+            .stdout
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| {
+                String::from_utf8_lossy(line)
+                    .trim_end_matches('\r')
+                    .to_owned()
+            })
+            .collect();
+        if batch.len() != end - start {
+            return Err(HashFilesError::Git(parse_failure(
+                "git hash-object returned an unexpected hash count",
+            )));
+        }
+        hashes.extend(batch);
+        start = end;
+        #[cfg(debug_assertions)]
+        hash_batch_test_gate();
+    }
+    Ok(hashes)
+}
+
+#[cfg(debug_assertions)]
+fn hash_batch_test_gate() {
+    let (Ok(marker), Ok(release)) = (
+        std::env::var("RAMIZ_TEST_HASH_BATCH_MARKER"),
+        std::env::var("RAMIZ_TEST_HASH_BATCH_RELEASE"),
+    ) else {
+        return;
+    };
+    if std::fs::write(&marker, b"ready").is_err() {
+        return;
+    }
+    while !Path::new(&release).exists() && !cancellation::requested() {
+        std::thread::sleep(std::time::Duration::from_millis(5));
     }
 }
 

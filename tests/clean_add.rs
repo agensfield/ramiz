@@ -704,6 +704,145 @@ fn handled_interrupt_after_registration_rolls_back_owned_state() {
 }
 
 #[test]
+#[cfg(debug_assertions)]
+fn interrupt_drains_clean_workers_before_rollback() {
+    let fixture = Fixture::new("worker-interrupt");
+    let repo = init_repo(fixture.path());
+    if !cow_available(&repo) {
+        return;
+    }
+    for index in 0..32 {
+        fs::write(repo.join(format!("file-{index:02}")), "content\n").unwrap();
+    }
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "initial"]);
+
+    let marker = fixture.path().join("worker-ready");
+    let release = fixture.path().join("worker-release");
+    let destination = fixture.path().join("worktree");
+    let child = ramiz_command(
+        &repo,
+        &[
+            "add",
+            "--json",
+            "--require-cow",
+            "-b",
+            "worker-interrupted",
+            destination.to_str().unwrap(),
+        ],
+    )
+    .env("RAMIZ_TEST_CLEAN_WORKER_MARKER", &marker)
+    .env("RAMIZ_TEST_CLEAN_WORKER_RELEASE", &release)
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
+    .spawn()
+    .unwrap();
+    for _ in 0..500 {
+        if marker.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(marker.exists(), "clean workers never reached the test gate");
+    // SAFETY: child.id() identifies the live Ramiz subprocess owned by this test.
+    assert_eq!(
+        unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGINT) },
+        0
+    );
+    let output = child.wait_with_output().unwrap();
+    assert!(!output.status.success());
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["error"]["code"], "interrupted");
+    assert!(!destination.exists());
+    let branch = Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args([
+            "show-ref",
+            "--verify",
+            "--quiet",
+            "refs/heads/worker-interrupted",
+        ])
+        .status()
+        .unwrap();
+    assert!(!branch.success());
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn interrupt_between_hash_batches_rolls_back_before_workers_and_hook() {
+    let fixture = Fixture::new("hash-interrupt");
+    let repo = init_repo(fixture.path());
+    if !cow_available(&repo) {
+        return;
+    }
+    for index in 0..256 {
+        fs::write(repo.join(format!("file-{index:03}")), "content\n").unwrap();
+    }
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "initial"]);
+    let hook_receipt = fixture.path().join("hook-called");
+    let hook = repo.join(".git/hooks/post-checkout");
+    fs::write(
+        &hook,
+        format!("#!/bin/sh\nprintf called > '{}'\n", hook_receipt.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let marker = fixture.path().join("hash-ready");
+    let release = fixture.path().join("hash-release");
+    let destination = fixture.path().join("worktree");
+    let child = ramiz_command(
+        &repo,
+        &[
+            "add",
+            "--json",
+            "--require-cow",
+            "-b",
+            "hash-interrupted",
+            destination.to_str().unwrap(),
+        ],
+    )
+    .env("RAMIZ_TEST_HASH_BATCH_MARKER", &marker)
+    .env("RAMIZ_TEST_HASH_BATCH_RELEASE", &release)
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
+    .spawn()
+    .unwrap();
+    for _ in 0..500 {
+        if marker.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(marker.exists(), "hashing never reached the batch boundary");
+    // SAFETY: child.id() identifies the live Ramiz subprocess owned by this test.
+    assert_eq!(
+        unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGINT) },
+        0
+    );
+    let output = child.wait_with_output().unwrap();
+    assert!(!output.status.success());
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["error"]["code"], "interrupted");
+    assert!(!destination.exists());
+    assert!(!hook_receipt.exists());
+    let branch = Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args([
+            "show-ref",
+            "--verify",
+            "--quiet",
+            "refs/heads/hash-interrupted",
+        ])
+        .status()
+        .unwrap();
+    assert!(!branch.success());
+}
+
+#[test]
 fn branch_shorthand_existing_branch_and_detached_forms_match_git() {
     let fixture = Fixture::new("grammar");
     let repo = init_repo(fixture.path());
@@ -817,8 +956,16 @@ fn sha256_repository_uses_matching_hook_object_ids() {
     );
     git(&repo, &["config", "user.name", "Ramiz Test"]);
     git(&repo, &["config", "user.email", "ramiz@example.invalid"]);
-    fs::write(repo.join("file"), "content\n").unwrap();
-    git(&repo, &["add", "file"]);
+    let file_name = "line\nbreak";
+    for index in 0..130 {
+        let name = if index == 64 {
+            file_name.to_owned()
+        } else {
+            format!("file-{index:03}")
+        };
+        fs::write(repo.join(name), format!("content {index}\n")).unwrap();
+    }
+    git(&repo, &["add", "."]);
     git(&repo, &["commit", "-qm", "initial"]);
     let hook = repo.join(".git/hooks/post-checkout");
     fs::write(&hook, "#!/bin/sh\nprintf '%s\\n' \"$*\" > hook.args\n").unwrap();
@@ -842,6 +989,10 @@ fn sha256_repository_uses_matching_hook_object_ids() {
     );
     let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(envelope["data"]["head"].as_str().unwrap().len(), 64);
+    assert_eq!(
+        fs::read(destination.join(file_name)).unwrap(),
+        b"content 64\n"
+    );
     let args = fs::read_to_string(destination.join("hook.args")).unwrap();
     let fields: Vec<&str> = args.split_whitespace().collect();
     assert_eq!(fields[0].len(), 64);
