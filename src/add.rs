@@ -4,6 +4,11 @@ use std::{
     fs,
     io::Write,
     path::{Component, Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc,
+    },
+    thread,
 };
 
 use serde::Serialize;
@@ -30,6 +35,20 @@ struct HookData {
     encoding: &'static str,
     stdout: String,
     stderr: String,
+}
+
+struct CleanCandidate {
+    path: OsString,
+    oid: String,
+    source: PathBuf,
+    target: PathBuf,
+    executable: bool,
+}
+
+enum CloneOutcome {
+    Retained(usize),
+    Checkout(usize),
+    Fatal(usize, String),
 }
 
 pub fn run(args: AddArgs) -> Result<(), RamizError> {
@@ -202,75 +221,14 @@ fn run_clean(args: AddArgs) -> Result<(), RamizError> {
     let entries = git::read_target_index(&destination, &target).map_err(|error| {
         fail_with_rollback("index_materialization", error, args.json, &mut transaction)
     })?;
-    let mut git_paths = Vec::new();
-    let mut cow_files = 0usize;
-    for entry in entries {
-        check_cancelled(args.json, &mut transaction)?;
-        if entry.stage != 0 || !matches!(entry.mode, 0o100644 | 0o100755) {
-            git_paths.push(entry.path);
-            continue;
-        }
-        let Some(donor) = &donor else {
-            git_paths.push(entry.path);
-            continue;
-        };
-        let source = donor.join(&entry.path);
-        let source_meta = match fs::symlink_metadata(&source) {
-            Ok(meta) if meta.is_file() => meta,
-            _ => {
-                git_paths.push(entry.path);
-                continue;
-            }
-        };
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let expected_executable = entry.mode == 0o100755;
-            let donor_executable = source_meta.permissions().mode() & 0o111 != 0;
-            if expected_executable != donor_executable {
-                git_paths.push(entry.path);
-                continue;
-            }
-        }
-        if git::path_has_transform(&destination, &entry.path).map_err(|error| {
-            fail_with_rollback("attribute_lookup", error, args.json, &mut transaction)
-        })? {
-            git_paths.push(entry.path);
-            continue;
-        }
-        let source_oid = git::hash_file(&destination, &source).map_err(|error| {
-            fail_with_rollback("donor_verification", error, args.json, &mut transaction)
-        })?;
-        if source_oid != entry.oid {
-            git_paths.push(entry.path);
-            continue;
-        }
-        let target_path = destination.join(&entry.path);
-        if let Some(parent) = target_path.parent() {
-            fs::create_dir_all(parent).map_err(|error| {
-                io_failure("materialization_failed", error, args.json, &mut transaction)
-            })?;
-        }
-        if backend.is_none() || fsclone::clone_file(&source, &target_path).is_err() {
-            let _ = fs::remove_file(&target_path);
-            git_paths.push(entry.path);
-            continue;
-        }
-        if fsclone::normalize_clean_file(&target_path, entry.mode == 0o100755).is_err() {
-            let _ = fs::remove_file(&target_path);
-            git_paths.push(entry.path);
-            continue;
-        }
-        let cloned_oid = git::hash_file(&destination, &target_path).map_err(|error| {
-            fail_with_rollback("clone_verification", error, args.json, &mut transaction)
-        })?;
-        if cloned_oid != entry.oid {
-            let _ = fs::remove_file(&target_path);
-            git_paths.push(entry.path);
-            continue;
-        }
-        cow_files += 1;
-    }
+    let (cow_files, git_paths) = materialize_clean_files(
+        entries,
+        donor.as_deref(),
+        &destination,
+        backend,
+        args.json,
+        &mut transaction,
+    )?;
 
     git::checkout_paths(&destination, &git_paths).map_err(|error| {
         fail_with_rollback("checkout_failed", error, args.json, &mut transaction)
@@ -331,6 +289,238 @@ fn run_clean(args: AddArgs) -> Result<(), RamizError> {
         &warnings,
     );
     Ok(())
+}
+
+fn materialize_clean_files(
+    entries: Vec<git::IndexEntry>,
+    donor: Option<&Path>,
+    destination: &Path,
+    backend: Option<fsclone::Backend>,
+    json: bool,
+    transaction: &mut Transaction,
+) -> Result<(usize, Vec<OsString>), RamizError> {
+    let (Some(donor), Some(_backend)) = (donor, backend) else {
+        return Ok((0, entries.into_iter().map(|entry| entry.path).collect()));
+    };
+
+    let mut git_paths = Vec::new();
+    let mut candidates = Vec::new();
+    for entry in entries {
+        check_cancelled(json, transaction)?;
+        if entry.stage != 0 || !matches!(entry.mode, 0o100644 | 0o100755) {
+            git_paths.push(entry.path);
+            continue;
+        }
+        let source = donor.join(&entry.path);
+        let source_meta = match fs::symlink_metadata(&source) {
+            Ok(meta) if meta.is_file() => meta,
+            _ => {
+                git_paths.push(entry.path);
+                continue;
+            }
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let donor_executable = source_meta.permissions().mode() & 0o111 != 0;
+            if (entry.mode == 0o100755) != donor_executable {
+                git_paths.push(entry.path);
+                continue;
+            }
+        }
+        candidates.push(CleanCandidate {
+            target: destination.join(&entry.path),
+            source,
+            executable: entry.mode == 0o100755,
+            path: entry.path,
+            oid: entry.oid,
+        });
+    }
+
+    check_cancelled(json, transaction)?;
+    let candidate_paths: Vec<OsString> = candidates
+        .iter()
+        .map(|candidate| candidate.path.clone())
+        .collect();
+    let transformed = git::transformed_paths(destination, &candidate_paths)
+        .map_err(|error| fail_with_rollback("attribute_lookup", error, json, transaction))?;
+    let mut hash_candidates = Vec::new();
+    for candidate in candidates {
+        if transformed.contains(&candidate.path) {
+            git_paths.push(candidate.path);
+        } else {
+            hash_candidates.push(candidate);
+        }
+    }
+
+    check_cancelled(json, transaction)?;
+    let source_paths: Vec<PathBuf> = hash_candidates
+        .iter()
+        .map(|candidate| candidate.source.clone())
+        .collect();
+    let source_hashes = hash_clean_files(
+        destination,
+        &source_paths,
+        "donor_verification",
+        json,
+        transaction,
+    )?;
+    let mut clone_candidates = Vec::new();
+    for (candidate, source_oid) in hash_candidates.into_iter().zip(source_hashes) {
+        if source_oid == candidate.oid {
+            clone_candidates.push(candidate);
+        } else {
+            git_paths.push(candidate.path);
+        }
+    }
+
+    let umask = fsclone::capture_umask();
+    let next = AtomicUsize::new(0);
+    let stop = AtomicBool::new(false);
+    let (sender, receiver) = mpsc::channel();
+    let worker_count = clone_candidates.len().min(4);
+    let panicked = thread::scope(|scope| {
+        let mut workers = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
+            let sender = sender.clone();
+            let next = &next;
+            let stop = &stop;
+            let candidates = &clone_candidates;
+            workers.push(scope.spawn(move || {
+                loop {
+                    if stop.load(Ordering::Relaxed) || cancellation::requested() {
+                        stop.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(candidate) = candidates.get(index) else {
+                        break;
+                    };
+                    #[cfg(debug_assertions)]
+                    clean_worker_test_gate();
+                    if cancellation::requested() {
+                        stop.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                    if let Some(parent) = candidate.target.parent() {
+                        if let Err(error) = fs::create_dir_all(parent) {
+                            stop.store(true, Ordering::Relaxed);
+                            let _ = sender.send(CloneOutcome::Fatal(
+                                index,
+                                format!("create {}: {error}", parent.display()),
+                            ));
+                            break;
+                        }
+                    }
+                    if fsclone::clone_file(&candidate.source, &candidate.target).is_err()
+                        || fsclone::normalize_clean_file(
+                            &candidate.target,
+                            candidate.executable,
+                            umask,
+                        )
+                        .is_err()
+                    {
+                        let _ = fs::remove_file(&candidate.target);
+                        let _ = sender.send(CloneOutcome::Checkout(index));
+                    } else {
+                        let _ = sender.send(CloneOutcome::Retained(index));
+                    }
+                }
+            }));
+        }
+        workers
+            .into_iter()
+            .fold(false, |panicked, worker| worker.join().is_err() || panicked)
+    });
+    drop(sender);
+    let mut outcomes: Vec<CloneOutcome> = receiver.into_iter().collect();
+    outcomes.sort_by_key(|outcome| match outcome {
+        CloneOutcome::Retained(index)
+        | CloneOutcome::Checkout(index)
+        | CloneOutcome::Fatal(index, _) => *index,
+    });
+    if panicked {
+        return Err(fail_message(
+            "materialization_failed",
+            "clean materialization worker panicked",
+            json,
+            transaction,
+        ));
+    }
+    check_cancelled(json, transaction)?;
+    if let Some(message) = outcomes.iter().find_map(|outcome| match outcome {
+        CloneOutcome::Fatal(_, message) => Some(message.clone()),
+        _ => None,
+    }) {
+        return Err(fail_message(
+            "materialization_failed",
+            message,
+            json,
+            transaction,
+        ));
+    }
+    if outcomes.len() != clone_candidates.len() {
+        return Err(fail_message(
+            "materialization_failed",
+            "clean materialization workers returned incomplete results",
+            json,
+            transaction,
+        ));
+    }
+
+    let mut retained = Vec::new();
+    for outcome in outcomes {
+        match outcome {
+            CloneOutcome::Retained(index) => retained.push(index),
+            CloneOutcome::Checkout(index) => {
+                git_paths.push(clone_candidates[index].path.clone());
+            }
+            CloneOutcome::Fatal(_, _) => unreachable!(),
+        }
+    }
+    let target_paths: Vec<PathBuf> = retained
+        .iter()
+        .map(|index| clone_candidates[*index].target.clone())
+        .collect();
+    let target_hashes = hash_clean_files(
+        destination,
+        &target_paths,
+        "clone_verification",
+        json,
+        transaction,
+    )?;
+    let mut cow_files = 0;
+    for (index, cloned_oid) in retained.into_iter().zip(target_hashes) {
+        let candidate = &clone_candidates[index];
+        if cloned_oid == candidate.oid {
+            cow_files += 1;
+        } else {
+            let _ = fs::remove_file(&candidate.target);
+            git_paths.push(candidate.path.clone());
+        }
+    }
+    Ok((cow_files, git_paths))
+}
+
+fn hash_clean_files(
+    destination: &Path,
+    paths: &[PathBuf],
+    failure_code: &'static str,
+    json: bool,
+    transaction: &mut Transaction,
+) -> Result<Vec<String>, RamizError> {
+    match git::hash_files(destination, paths) {
+        Ok(hashes) => Ok(hashes),
+        Err(git::HashFilesError::Git(error)) => {
+            Err(fail_with_rollback(failure_code, error, json, transaction))
+        }
+        Err(git::HashFilesError::Cancelled) => Err(fail_message(
+            "interrupted",
+            "creation interrupted",
+            json,
+            transaction,
+        )),
+    }
 }
 
 fn run_unborn(args: AddArgs, cwd: PathBuf, repo_root: Option<PathBuf>) -> Result<(), RamizError> {
@@ -1246,6 +1436,22 @@ fn check_cancelled(json: bool, transaction: &mut Transaction) -> Result<(), Rami
         ));
     }
     Ok(())
+}
+
+#[cfg(debug_assertions)]
+fn clean_worker_test_gate() {
+    let (Ok(marker), Ok(release)) = (
+        std::env::var("RAMIZ_TEST_CLEAN_WORKER_MARKER"),
+        std::env::var("RAMIZ_TEST_CLEAN_WORKER_RELEASE"),
+    ) else {
+        return;
+    };
+    if fs::write(&marker, b"ready").is_err() {
+        return;
+    }
+    while !Path::new(&release).exists() && !cancellation::requested() {
+        thread::sleep(std::time::Duration::from_millis(5));
+    }
 }
 
 #[cfg(debug_assertions)]
