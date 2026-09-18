@@ -527,7 +527,7 @@ unsafe fn restore_env(name: &str, value: Option<std::ffi::OsString>) {
 #[test]
 #[ignore = "release-only: requires the candidate version to exist on crates.io"]
 fn cargo_release_updates_the_actual_previous_public_release() {
-    const PREVIOUS_VERSION: &str = "1.0.0";
+    const PREVIOUS_VERSION: &str = "1.0.1";
     let root = std::env::temp_dir().join(format!(
         "ramiz-cargo-release-acceptance-{}",
         std::process::id()
@@ -643,7 +643,7 @@ fn cargo_release_updates_the_actual_previous_public_release() {
 #[test]
 #[ignore = "release-only: downloads the previous public GitHub release"]
 fn binstall_release_recognizes_the_actual_previous_public_installation() {
-    const PREVIOUS_VERSION: &str = "1.0.0";
+    const PREVIOUS_VERSION: &str = "1.0.1";
     let root = std::env::temp_dir().join(format!(
         "ramiz-binstall-release-acceptance-{}",
         std::process::id()
