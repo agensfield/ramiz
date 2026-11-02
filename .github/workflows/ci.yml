@@ -19,7 +19,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-24.04, macos-26, xcode-27]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:
@@ -117,3 +117,15 @@ jobs:
           test "$(cat "$repo/file.txt")" = 'ficlone acceptance'
           printf 'source mutation\n' > "$repo/file.txt"
           test "$(cat "$repo/worktree/file.txt")" = 'target mutation'
+
+  current-rust:
+    name: Current Rust (macOS 26)
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+      - run: rustup update stable --no-self-update
+      - run: rustup component add --toolchain stable clippy
+      - run: cargo +stable clippy --locked --all-targets -- -D warnings
+      - run: cargo +stable test --locked

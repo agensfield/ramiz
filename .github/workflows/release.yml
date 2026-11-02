@@ -14,7 +14,7 @@ concurrency:
 jobs:
   source:
     if: github.repository == 'agensfield/ramiz'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: read
@@ -59,13 +59,13 @@ jobs:
       matrix:
         include:
           - target: aarch64-apple-darwin
-            runner: macos-14
+            runner: macos-26
           - target: x86_64-apple-darwin
-            runner: macos-15-intel
+            runner: macos-26-intel
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm
           - target: x86_64-unknown-linux-musl
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     steps:
@@ -123,7 +123,7 @@ jobs:
 
   sign:
     needs: [source, build]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     permissions:
       contents: read
@@ -192,7 +192,7 @@ jobs:
 
   draft:
     needs: [source, sign]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     permissions:
       contents: write
@@ -304,7 +304,7 @@ jobs:
 
   publish-crate:
     needs: [source, draft]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
       contents: read
@@ -361,7 +361,7 @@ jobs:
 
   binstall:
     needs: [source, draft, publish-crate]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     permissions:
       contents: read
@@ -394,7 +394,7 @@ jobs:
 
   cargo-update:
     needs: [source, publish-crate]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     permissions:
       contents: read
@@ -410,7 +410,7 @@ jobs:
 
   publish:
     needs: [source, draft, publish-crate, binstall, cargo-update]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: write
@@ -427,7 +427,7 @@ jobs:
   recovery:
     needs: [source, draft, publish-crate, binstall, cargo-update, publish]
     if: ${{ always() && (needs.draft.result == 'failure' || needs.publish-crate.result == 'failure' || needs.binstall.result == 'failure' || needs.cargo-update.result == 'failure') }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       contents: read
