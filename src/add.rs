@@ -428,9 +428,12 @@ fn materialize_clean_files(
                 }
             }));
         }
-        workers
+        // Every worker must be joined; Iterator::any would short-circuit.
+        #[allow(clippy::unnecessary_fold)]
+        let panicked = workers
             .into_iter()
-            .fold(false, |panicked, worker| worker.join().is_err() || panicked)
+            .fold(false, |panicked, worker| worker.join().is_err() || panicked);
+        panicked
     });
     drop(sender);
     let mut outcomes: Vec<CloneOutcome> = receiver.into_iter().collect();

@@ -177,7 +177,12 @@ pub fn materialize(
             ));
         }
         match entry.mode as libc::mode_t & libc::S_IFMT {
-            libc::S_IFDIR => fs::create_dir(&target).map_err(|e| e.to_string())?,
+            libc::S_IFDIR => {
+                fs::create_dir(&target).map_err(|e| e.to_string())?;
+                preserve_backup_exclusion(&source, &target).map_err(|e| {
+                    format!("preserve backup exclusion on {}: {e}", relative.display())
+                })?;
+            }
             libc::S_IFREG => {
                 if let Some(first) = hardlinks.get(&(entry.dev, entry.ino)) {
                     fs::hard_link(first, &target).map_err(|e| e.to_string())?;
@@ -217,7 +222,7 @@ pub fn materialize(
         }
     }
     report.warnings.push(
-        "directory/symlink ACLs and xattrs are not copied; platform metadata may differ".into(),
+        "directory/symlink ACLs and xattrs are not copied except macOS directory backup exclusions; platform metadata may differ".into(),
     );
     #[cfg(target_os = "linux")]
     report
@@ -324,4 +329,67 @@ fn resolve_link_target(path: PathBuf, destination: &Path, donor: &Path) -> io::R
         Ok(resolved)
     }
     walk(&path, &mut 40, destination, donor)
+}
+
+// Preserve existing backup intent before materializing descendants. This is
+// metadata propagation only: Ramiz never decides which folders are disposable.
+#[cfg(target_os = "macos")]
+fn preserve_backup_exclusion(source: &Path, target: &Path) -> io::Result<()> {
+    let name = c"com.apple.metadata:com_apple_backup_excludeItem";
+    let source = CString::new(source.as_os_str().as_bytes())?;
+    let target = CString::new(target.as_os_str().as_bytes())?;
+    // SAFETY: strings/buffers remain alive; NOFOLLOW prevents symlink traversal.
+    let size = unsafe {
+        libc::getxattr(
+            source.as_ptr(),
+            name.as_ptr(),
+            std::ptr::null_mut(),
+            0,
+            0,
+            libc::XATTR_NOFOLLOW,
+        )
+    };
+    if size < 0 {
+        let error = io::Error::last_os_error();
+        return if error.raw_os_error() == Some(libc::ENOATTR) {
+            Ok(())
+        } else {
+            Err(error)
+        };
+    }
+    let mut value = vec![0u8; size as usize];
+    let read = unsafe {
+        libc::getxattr(
+            source.as_ptr(),
+            name.as_ptr(),
+            value.as_mut_ptr().cast(),
+            value.len(),
+            0,
+            libc::XATTR_NOFOLLOW,
+        )
+    };
+    if read != size {
+        return Err(io::Error::other(
+            "backup exclusion changed during inheritance",
+        ));
+    }
+    if unsafe {
+        libc::setxattr(
+            target.as_ptr(),
+            name.as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+            libc::XATTR_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn preserve_backup_exclusion(_source: &Path, _target: &Path) -> io::Result<()> {
+    Ok(())
 }

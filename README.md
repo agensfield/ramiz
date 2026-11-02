@@ -100,3 +100,8 @@ Ramiz is MIT-licensed. Its copy-on-write worktree design was informed by Can
 Bölük's MIT-licensed work in [Oh My Pi](https://github.com/can1357/oh-my-pi),
 particularly feature commit `ff91512b1d2927dd4cc095240ecf63749a32fca8`.
 See [NOTICE](NOTICE).
+
+On macOS, complete inheritance carries existing Time Machine backup-exclusion
+attributes on non-root directories before populating their descendants. Ramiz
+does not select backup policy or propagate fixed-path exclusions. Other directory
+extended attributes and ACLs remain outside the inheritance contract.
