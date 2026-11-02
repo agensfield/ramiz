@@ -96,3 +96,70 @@ fn rejects_nested_repository_and_indirect_donor_link_before_copy() {
     assert!(error.contains("points into donor"));
     assert_eq!(fs::read_dir(&destination).unwrap().count(), 0);
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn preserves_existing_directory_backup_marker_without_inventing_policy() {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+    let fixture = Fixture::new();
+    let donor = fixture.0.join("donor");
+    let destination = fixture.0.join("destination");
+    fs::create_dir(donor.join("marked")).unwrap();
+    fs::create_dir(donor.join("ordinary")).unwrap();
+    fs::write(donor.join("marked/file"), b"unique data").unwrap();
+    let marker = c"com.apple.metadata:com_apple_backup_excludeItem";
+    let source = CString::new(donor.join("marked").as_os_str().as_bytes()).unwrap();
+    let value = b"existing-donor-intent";
+    assert_eq!(
+        unsafe {
+            libc::setxattr(
+                source.as_ptr(),
+                marker.as_ptr(),
+                value.as_ptr().cast(),
+                value.len(),
+                0,
+                libc::XATTR_NOFOLLOW,
+            )
+        },
+        0
+    );
+    let snapshot = inherit::snapshot(&donor).unwrap();
+    inherit::materialize(&snapshot, &destination, &BTreeSet::new(), true, false).unwrap();
+    inherit::verify_unchanged(&snapshot).unwrap();
+    let target = CString::new(destination.join("marked").as_os_str().as_bytes()).unwrap();
+    let mut output = [0u8; 64];
+    let size = unsafe {
+        libc::getxattr(
+            target.as_ptr(),
+            marker.as_ptr(),
+            output.as_mut_ptr().cast(),
+            output.len(),
+            0,
+            libc::XATTR_NOFOLLOW,
+        )
+    };
+    assert_eq!(size as usize, value.len());
+    assert_eq!(&output[..size as usize], value);
+    let ordinary = CString::new(destination.join("ordinary").as_os_str().as_bytes()).unwrap();
+    assert_eq!(
+        unsafe {
+            libc::getxattr(
+                ordinary.as_ptr(),
+                marker.as_ptr(),
+                std::ptr::null_mut(),
+                0,
+                0,
+                libc::XATTR_NOFOLLOW,
+            )
+        },
+        -1
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ENOATTR)
+    );
+    assert_eq!(
+        fs::read(destination.join("marked/file")).unwrap(),
+        b"unique data"
+    );
+}
